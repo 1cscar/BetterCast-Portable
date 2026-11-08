@@ -32,7 +32,7 @@ if [[ "$binary" == "$build/LocalSmoke" ]]; then
     "$python" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM'
     run_case() {
         local width="$1" height="$2" codec="$3" label="$4" scenario="$5" trace=""
-        local experiment="${6:-${PORTABLE_EXPERIMENT:-default}}"
+        local experiment="${6:-${PORTABLE_EXPERIMENT:-production}}"
         if [[ "$scenario" == steady ]]; then
             trace="$(mktemp -d "$build/$label.XXXXXX")"
         fi
@@ -68,7 +68,7 @@ if [[ "$binary" == "$build/LocalSmoke" ]]; then
             read -r width height codec label experiment <<< "$row"
             if [[ -n "${2:-}" && "$2" != "$label" ]]; then continue; fi
             completed="$(printf '%s\t%s\tpass' "$label" "$experiment")"
-            if [[ "${PORTABLE_MATRIX_RESUME:-0}" == 1 ]] && rg -Fxq "$completed" "$build/matrix.tsv"; then continue; fi
+            if [[ "${PORTABLE_MATRIX_RESUME:-0}" == 1 ]] && /usr/bin/grep -Fxq "$completed" "$build/matrix.tsv"; then continue; fi
             if run_case "$width" "$height" "$codec" "$label" steady "$experiment"; then
                 status=pass
             else

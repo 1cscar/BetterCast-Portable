@@ -29,7 +29,7 @@ struct LocalSmoke {
         let host = PortableHost(traceDirectory: directory.isEmpty ? nil : URL(fileURLWithPath: directory),
                                 listenPort: 0, pairingSeconds: scenario == "expired" ? 2 : 300,
                                 approvalSeconds: scenario == "approval_timeout" ? 2 : 30,
-                                performance: PortablePerformance(experiment: ProcessInfo.processInfo.environment["PORTABLE_EXPERIMENT"] ?? "default"))
+                                performance: PortablePerformance(experiment: ProcessInfo.processInfo.environment["PORTABLE_EXPERIMENT"] ?? "production"))
         func displayID(_ screen: NSScreen) -> UInt32? {
             (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
         }

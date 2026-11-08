@@ -9,8 +9,9 @@ struct PortablePerformance {
     var keyframeSeconds = 2.0
     var useDisplayLink = false
     var metalMotion = false
+    var preferLowLatency4KH264 = false
 
-    init(experiment: String = "default") {
+    init(experiment: String = "production") {
         switch experiment {
         case "headroom": capture.minimumFrameInterval = CMTime(value: 1, timescale: 120)
         case "uncapped": capture.minimumFrameInterval = .zero
@@ -18,19 +19,25 @@ struct PortablePerformance {
         case "depth8": capture.queueDepth = 8
         case "bgra": capture.pixelFormat = kCVPixelFormatType_32BGRA
         case "display-link": useDisplayLink = true
-        case "metal-motion": useDisplayLink = true; metalMotion = true
+        case "metal-motion":
+            useDisplayLink = true
+            metalMotion = true
         case "low-latency": encoder.lowLatencyRateControl = true
         case "delay0": encoder.maxFrameDelay = 0
         case "speed": encoder.prioritizeSpeed = true
         case "realtime-off": encoder.realTime = false
         case "reorder": encoder.allowReordering = true
         case "gop1": keyframeSeconds = 1
+        case "production": preferLowLatency4KH264 = true
+        case "production-headroom":
+            preferLowLatency4KH264 = true
+            capture.minimumFrameInterval = CMTime(value: 1, timescale: 120)
         case "default": break
         default: preconditionFailure("Unknown performance experiment: \(experiment)")
         }
     }
 
-    var description: String {
+    func description(using encoder: PortableEncoderSettings) -> String {
         "interval=\(capture.minimumFrameInterval.value)/\(capture.minimumFrameInterval.timescale) depth=\(capture.queueDepth) format=\(capture.pixelFormat) low_latency=\(encoder.lowLatencyRateControl) realtime=\(encoder.realTime) reorder=\(encoder.allowReordering) delay=\(encoder.maxFrameDelay) speed=\(encoder.prioritizeSpeed) gop=\(keyframeSeconds) display_link_source=\(useDisplayLink) metal_source=\(metalMotion)"
     }
 }

@@ -188,6 +188,7 @@ class VideoEncoder {
         
         if status != noErr {
             LogManager.shared.log("VideoEncoder: Failed to create session \(status)")
+            invalidate()
             return
         }
         
@@ -228,9 +229,8 @@ class VideoEncoder {
         setProperty(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, keyframeIntervalSeconds as CFNumber)
         setProperty(kVTCompressionPropertyKey_AllowFrameReordering, portableSettings.allowReordering ? kCFBooleanTrue : kCFBooleanFalse)
         setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, expectedFPS as CFNumber)
-        // Emit each frame as soon as it's encoded — no rate-control lookahead buffering.
-        // With no frame reordering this is safe and shaves a frame of latency off interactive
-        // use (e.g. typing on an extended display mirrored to the receiver).
+        // Request a small compression window. Some hardware encoders reject the
+        // property, so Portable measurements also track frames actually in flight.
         setProperty(kVTCompressionPropertyKey_MaxFrameDelayCount, portableSettings.maxFrameDelay as CFNumber)
         if portableSettings.prioritizeSpeed {
             setProperty(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)

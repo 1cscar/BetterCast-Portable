@@ -209,11 +209,27 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         request = ""
         let width = peer.width
         let height = peer.height
-        var encoderSettings = performance.encoder
-        encoderSettings.logProperties = traceDirectory != nil
-        let encoder = VideoEncoder(connectionId: UUID(), width: width, height: height,
-                                   bitrate: 20_000_000, expectedFPS: 60, keyframeIntervalSeconds: performance.keyframeSeconds,
-                                   codec: peer.codec, requireHardware: true, portableSettings: encoderSettings)
+        func makeEncoder(settings: PortableEncoderSettings) -> VideoEncoder {
+            VideoEncoder(connectionId: UUID(), width: width, height: height,
+                         bitrate: 20_000_000, expectedFPS: 60, keyframeIntervalSeconds: performance.keyframeSeconds,
+                         codec: peer.codec, requireHardware: true, portableSettings: settings)
+        }
+
+        let preferLowLatency = performance.preferLowLatency4KH264
+            && peer.codec == .h264 && width * height >= 3840 * 2160
+        var settings = performance.encoder
+        settings.logProperties = traceDirectory != nil
+        if preferLowLatency { settings.lowLatencyRateControl = true }
+        let preferred = makeEncoder(settings: settings)
+        let encoder: VideoEncoder
+        if preferLowLatency && !preferred.isReady {
+            LogManager.shared.log("Portable VT: low-latency H.264 unavailable, using the standard hardware encoder")
+            settings.lowLatencyRateControl = false
+            encoder = makeEncoder(settings: settings)
+        } else {
+            encoder = preferred
+        }
+        let traceSettings = performance.description(using: settings)
         guard encoder.isReady else {
             reject(peer, "No hardware encoder for this codec and size. Try H.264 or a smaller mode.")
             return
@@ -245,7 +261,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                 guard let self, let peer, self.peer === peer, !peer.ending else { return }
                 if let mode = self.activateMode(id, width: width, height: height) {
                     print("Portable extension id=\(id) mode=\(mode.pixelWidth)x\(mode.pixelHeight) points=\(mode.width)x\(mode.height) refresh=\(mode.refreshRate) mirror=0")
-                    self.startCapture(encoder, peer: peer, displayID: id, refresh: mode.refreshRate)
+                    self.startCapture(encoder, peer: peer, displayID: id, refresh: mode.refreshRate, settings: traceSettings)
                     return
                 }
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -267,7 +283,8 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         return nil
     }
 
-    private func startCapture(_ encoder: VideoEncoder, peer: Peer, displayID: CGDirectDisplayID, refresh: Double) {
+    private func startCapture(_ encoder: VideoEncoder, peer: Peer, displayID: CGDirectDisplayID, refresh: Double,
+                              settings: String) {
         let width = peer.width
         let height = peer.height
         captured = CaptureCount()
@@ -279,7 +296,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         recorder.portableSettings = performance.capture
         if let traceDirectory {
             trace = SessionTrace(directory: traceDirectory, width: width, height: height, codec: peer.codec,
-                                 refresh: refresh, settings: performance.description)
+                                 refresh: refresh, settings: settings)
             trace?.record("approved")
             canShowMotion = true
         }

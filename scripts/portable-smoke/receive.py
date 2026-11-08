@@ -126,7 +126,6 @@ def receive(s, bitstream):
         if start is not None and time.monotonic() - start >= duration:
             break
     elapsed = time.monotonic() - start
-    assert count >= 30 and len(pts) == count and len(access_units) >= 30
     if scenario == "reset":
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     if sampler:
@@ -137,6 +136,9 @@ def receive(s, bitstream):
             writer = csv.writer(output)
             writer.writerow(("event", "pts_100ns", "time_ns", "value"))
             writer.writerows(events)
+    if count < 30 or len(pts) != count or len(access_units) < 30:
+        raise RuntimeError(f"Invalid frame coverage: {count} access units, {len(pts)} unique PTS, "
+                           f"{len(access_units)} distinct payloads in {elapsed:.2f} s")
     print(f"PASS received {count} authenticated access units, {len(pts)} unique PTS, {len(access_units)} distinct payloads in {elapsed:.2f} s; {count/elapsed:.1f} RX FPS, {media_bytes*8/elapsed/1e6:.2f} Mb/s", flush=True)
 
 
