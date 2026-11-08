@@ -124,7 +124,8 @@ def summarize(host_path, receiver_path, loopback):
                 latency(f"{name} interval", [b - a for a, b in zip(times, times[1:])])
         if host["metal_presented"] or host["metal_not_presented"]:
             print(f"Metal not presented {len(during(host['metal_not_presented']))}; "
-                  f"no drawable {len(during(host['metal_no_drawable']))}")
+                  f"no drawable {len(during(host['metal_no_drawable']))}; "
+                  f"render busy {len(during(host['metal_render_busy']))}")
         latency("Motion draw/submit duration", [v for _, _, v in during(host["draw_duration"])])
         print(f"SCK blank {len(during(host['blank']))}; dirty rects unavailable "
               f"{sum(v < 0 for _, _, v in during(host['capture']))}")

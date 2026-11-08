@@ -13,6 +13,8 @@ final class MetalMotionView: NSView {
     private let scale: CGFloat
     private let trace: SessionTrace?
     private var serial: UInt32 = 0
+    private let renderQueue = DispatchQueue(label: "org.bettercast.portable.test-motion")
+    private let drawableSlot = DispatchSemaphore(value: 1)
 
     init(frame: NSRect, scale: CGFloat, trace: SessionTrace?) throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -39,35 +41,47 @@ final class MetalMotionView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func advance() {
-        let begin = DispatchTime.now().uptimeNanoseconds
-        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-        guard let drawable = metalLayer.nextDrawable(), let commands = queue.makeCommandBuffer() else {
-            trace?.record("metal_no_drawable")
+        guard drawableSlot.wait(timeout: .now()) == .success else {
+            trace?.record("metal_render_busy")
             return
         }
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = drawable.texture
-        pass.colorAttachments[0].loadAction = .dontCare
-        pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
+        let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
         serial += 1
-        let frameNumber = Int(serial)
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentBytes(&serial, length: MemoryLayout<UInt32>.size, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding()
-        drawable.addPresentedHandler { [trace] frame in
-            if frame.presentedTime > 0 {
-                trace?.record("metal_presented", 0, frameNumber, at: UInt64(frame.presentedTime * 1e9))
-            } else {
-                trace?.record("metal_not_presented", 0, frameNumber)
+        let frameNumber = serial
+
+        // nextDrawable can wait for the compositor. Keep that wait off the
+        // main queue, which also delivers encrypted transport completions.
+        renderQueue.async { [metalLayer, queue, pipeline, trace, drawableSlot] in
+            defer { drawableSlot.signal() }
+            let begin = DispatchTime.now().uptimeNanoseconds
+            guard let drawable = metalLayer.nextDrawable(), let commands = queue.makeCommandBuffer() else {
+                trace?.record("metal_no_drawable")
+                return
             }
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = drawable.texture
+            pass.colorAttachments[0].loadAction = .dontCare
+            pass.colorAttachments[0].storeAction = .store
+            guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return }
+            var frame = frameNumber
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.size, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+            drawable.addPresentedHandler { [trace] frame in
+                if frame.presentedTime > 0 {
+                    trace?.record("metal_presented", 0, Int(frameNumber), at: UInt64(frame.presentedTime * 1e9))
+                } else {
+                    trace?.record("metal_not_presented", 0, Int(frameNumber))
+                }
+            }
+            commands.present(drawable)
+            commands.commit()
+            let end = DispatchTime.now().uptimeNanoseconds
+            trace?.record("motion", 0, Int(frameNumber), at: end)
+            trace?.record("draw_duration", 0, Int(end - begin), at: end)
         }
-        commands.present(drawable)
-        commands.commit()
-        let end = DispatchTime.now().uptimeNanoseconds
-        trace?.record("motion", 0, frameNumber, at: end)
-        trace?.record("draw_duration", 0, Int(end - begin), at: end)
     }
 
     private static let shader = """
