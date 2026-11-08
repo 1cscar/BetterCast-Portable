@@ -65,7 +65,7 @@ def summarize(host_path, receiver_path, loopback):
     present = by_pts(receiver["present"])
     backpressure = by_pts(host["backpressure"])
     cohort = set(capture)
-    if not cohort or not (cohort & received):
+    if not cohort or not (cohort & received.keys()):
         raise SystemExit("No matching authenticated media for the measured capture cohort.")
     # Approximate the receiver window using the lowest observed read transit. It includes
     # the unknown clock offset, so its value is never reported as absolute LAN latency.

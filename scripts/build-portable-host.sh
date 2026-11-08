@@ -51,6 +51,7 @@ if [[ "$binary" == "$build/LocalSmoke" ]]; then
         if [[ "$1" == --steady ]]; then scenario=steady; fi
         for mode in '1920 1080 1 1080p-h264' '2560 1440 1 1440p-h264' '3840 2160 2 4k-hevc' '3840 2160 1 4k-h264'; do
             read -r width height codec label <<< "$mode"
+            if [[ -n "${2:-}" && "$2" != "$label" ]]; then continue; fi
             run_case "$width" "$height" "$codec" "$label" "$scenario"
         done
     fi
