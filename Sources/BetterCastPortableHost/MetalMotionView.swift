@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import AppKit
 import Metal
-import QuartzCore
+@preconcurrency import QuartzCore
 
 /// A second real stimulus with observable presentation timestamps. Each frame
 /// redraws the entire drawable and contains a moving pattern and a serial marker.
