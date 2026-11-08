@@ -4,6 +4,7 @@ import argparse
 from collections import defaultdict
 import csv
 import math
+import statistics
 from pathlib import Path
 
 SECOND = 1_000_000_000
@@ -114,6 +115,53 @@ def summarize(host_path, receiver_path, loopback):
     def stage_latency(label, earlier, later):
         latency(label, [later[pts] - earlier[pts] for pts in cohort & earlier.keys() & later.keys()
                         if later[pts] >= earlier[pts]])
+
+    if host["vt_submit"]:
+        for name in ("motion_tick", "motion", "display_tick", "display_callback", "metal_presented", "sck_display_time"):
+            times = sorted(set(t for _, t, _ in during(host[name])))
+            if times:
+                print(f"{name}: {len(times)} events")
+                latency(f"{name} interval", [b - a for a, b in zip(times, times[1:])])
+        if host["metal_presented"] or host["metal_not_presented"]:
+            print(f"Metal not presented {len(during(host['metal_not_presented']))}; "
+                  f"no drawable {len(during(host['metal_no_drawable']))}")
+        latency("Motion draw/submit duration", [v for _, _, v in during(host["draw_duration"])])
+        print(f"SCK blank {len(during(host['blank']))}; dirty rects unavailable "
+              f"{sum(v < 0 for _, _, v in during(host['capture']))}")
+        vt_submit = by_pts(host["vt_submit"])
+        vt_return = by_pts(host["vt_return"])
+        vt_output = by_pts(host["vt_output"])
+        display_time = by_pts(host["sck_display_time"])
+        offsets = [capture[pts] - display_time[pts] for pts in cohort & display_time.keys()]
+        latency("Capture callback minus SCK display time (signed)", offsets)
+        print(f"Display times ahead of callback: {sum(offset < 0 for offset in offsets)} / {len(offsets)}")
+        stage_latency("Capture callback → VT submit", capture, vt_submit)
+        stage_latency("VT submit → return", vt_submit, vt_return)
+        stage_latency("VT submit → output", vt_submit, vt_output)
+        stage_latency("VT output → access unit", vt_output, encode)
+        stage_latency("AES-GCM seal", by_pts(host["seal_start"]), by_pts(host["sealed"]))
+        inflight = 0
+        backlog = []
+        events = [(t, 1) for p, t in vt_submit.items() if p in cohort]
+        events += [(t, -1) for p, t in vt_output.items() if p in cohort]
+        for _, change in sorted(events, key=lambda event: (event[0], -event[1])):
+            inflight += change
+            if change == 1:
+                backlog.append(inflight)
+        print(f"VT outstanding at submit: peak {max(backlog, default=0)}, "
+              f"P95 {sorted(backlog)[math.ceil(len(backlog) * .95) - 1] if backlog else 0}; "
+              f"unpaired submits {inflight}; keyframes {len(during(host['vt_keyframe']))}; "
+              f"submit errors {sum(v != 0 for _, _, v in during(host['vt_return']))}; "
+              f"callback drops/errors {len(during(host['vt_drop_or_error']))}")
+        for name, divisor, unit in (
+            ("host_cpu_milli_pct", 1000, "%"), ("host_rss_kib", 1024, "MiB"),
+            ("receiver_cpu_milli_pct", 1000, "%"), ("receiver_rss_kib", 1024, "MiB"),
+            ("gpu_device_pct", 1, "%"), ("gpu_renderer_pct", 1, "%"),
+            ("gpu_memory_bytes", 1024 ** 2, "MiB"),
+        ):
+            values = [value / divisor for _, _, value in during(receiver[name])]
+            if values:
+                print(f"{name}: median {statistics.median(values):.1f}{unit}, peak {max(values):.1f}{unit}, n={len(values)}")
 
     stage_latency("Mac capture callback → encoded access unit", capture, encode)
     stage_latency("Mac encode → TCP submit", encode, submitted)

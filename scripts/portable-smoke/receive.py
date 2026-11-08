@@ -4,9 +4,12 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
 import socket
 import struct
+import subprocess
 import sys
+import threading
 import time
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -26,7 +29,35 @@ def read(s, n):
     return bytes(data)
 
 
-def receive(s):
+def sample_resources(stop, events):
+    # ps percentages are process samples; IORegistry utilisation is system-wide
+    # and does not isolate VideoToolbox's media engine.
+    host_pid = os.getppid()
+    receiver_pid = os.getpid()
+    while not stop.wait(2):
+        stamp = time.monotonic_ns()
+        ps = subprocess.run(
+            ["/bin/ps", "-p", f"{host_pid},{receiver_pid}", "-o", "pid=,%cpu=,rss="],
+            capture_output=True, text=True,
+        )
+        for line in ps.stdout.splitlines():
+            pid, cpu, rss = line.split()
+            prefix = "host" if int(pid) == host_pid else "receiver"
+            events.append((prefix + "_cpu_milli_pct", 0, stamp, round(float(cpu) * 1000)))
+            events.append((prefix + "_rss_kib", 0, stamp, int(rss)))
+        registry = subprocess.run(
+            ["/usr/sbin/ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+            capture_output=True, text=True,
+        )
+        for key, value in (("gpu_device_pct", "Device Utilization %"),
+                           ("gpu_renderer_pct", "Renderer Utilization %"),
+                           ("gpu_memory_bytes", "In use system memory")):
+            match = re.search(r'"' + re.escape(value) + r'"\s*=\s*(\d+)', registry.stdout)
+            if match:
+                events.append((key, 0, stamp, int(match.group(1))))
+
+
+def receive(s, bitstream):
     server = read(s, 32)
     nonce = os.urandom(32)
     pairing_secret = bytes([secret[0] ^ 1]) + secret[1:] if scenario == "wrong_code" else secret
@@ -40,6 +71,11 @@ def receive(s):
     pts = set()
     access_units = set()
     events = []
+    sampler_stop = threading.Event()
+    sampler = None
+    if directory:
+        sampler = threading.Thread(target=sample_resources, args=(sampler_stop, events), daemon=True)
+        sampler.start()
     start = None
     duration = {"steady": 70, "reset": 2, "window_close": 5}.get(scenario, 5)
     while True:
@@ -84,12 +120,18 @@ def receive(s):
                 assert n > 0
                 offset += 4 + n
                 assert offset <= len(msg)
+                if bitstream:
+                    bitstream.write(b"\x00\x00\x00\x01")
+                    bitstream.write(memoryview(msg)[offset - n:offset])
         if start is not None and time.monotonic() - start >= duration:
             break
     elapsed = time.monotonic() - start
     assert count >= 30 and len(pts) == count and len(access_units) >= 30
     if scenario == "reset":
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    if sampler:
+        sampler_stop.set()
+        sampler.join()
     if directory:
         with (Path(directory) / "loopback.csv").open("w", newline="") as output:
             writer = csv.writer(output)
@@ -101,7 +143,12 @@ def receive(s):
 try:
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
         assert scenario != "expired", "Expired listener still accepts connections"
-        receive(sock)
+        if directory and os.environ.get("PORTABLE_RECORD_BITSTREAM") == "1":
+            extension = "hevc" if codec == 2 else "h264"
+            with (Path(directory) / f"stream.{extension}").open("wb") as bitstream:
+                receive(sock, bitstream)
+        else:
+            receive(sock, None)
 except ConnectionRefusedError:
     if scenario != "expired":
         raise

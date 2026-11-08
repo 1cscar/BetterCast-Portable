@@ -3,6 +3,12 @@ import ScreenCaptureKit
 import CoreMedia
 import QuartzCore
 
+struct PortableCaptureSettings {
+    var minimumFrameInterval = CMTime(value: 1, timescale: 60)
+    var queueDepth = 3
+    var pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+}
+
 class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let lifecycleLock = NSLock()
     private var activeStream: SCStream?
@@ -28,7 +34,8 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Portable requires the requested virtual screen and forwards only real frames.
     let strictDisplayCapture: Bool
     var onCapturedFrame: ((CMTime) -> Void)?
-    var onCaptureStatus: ((SCFrameStatus?) -> Void)?
+    var portableSettings = PortableCaptureSettings()
+    var onPortableSample: ((CMSampleBuffer, SCFrameStatus?, [SCStreamFrameInfo: Any]?, UInt64) -> Void)?
 
     /// When true, uses CGDisplayStream instead of ScreenCaptureKit to capture.
     /// CGDisplayStream reads the GPU's composited framebuffer directly, which bypasses
@@ -128,7 +135,10 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             // SCK still has 3 free buffers in flight, so effective latency is unchanged.
             config.queueDepth = strictDisplayCapture ? 3 : (captureFPS > 60 ? 8 : 4)
             if strictDisplayCapture {
-                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                config.minimumFrameInterval = portableSettings.minimumFrameInterval
+                config.queueDepth = portableSettings.queueDepth
+                config.pixelFormat = portableSettings.pixelFormat
+                LogManager.shared.log("Portable SCStream: \(config.width)x\(config.height) interval=\(config.minimumFrameInterval.value)/\(config.minimumFrameInterval.timescale) depth=\(config.queueDepth) pixel_format=\(config.pixelFormat)")
             }
             config.capturesAudio = captureAudio
 
@@ -378,13 +388,12 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         case .screen:
             if strictDisplayCapture {
                 guard !stopRequested else { return }
-                let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-                    as? [[SCStreamFrameInfo: Any]]
-                let status = (attachments?.first?[.status] as? Int).flatMap(SCFrameStatus.init(rawValue:))
-                guard status == .complete, CMSampleBufferGetImageBuffer(sampleBuffer) != nil else {
-                    onCaptureStatus?(status)
-                    return
-                }
+                let arrived = DispatchTime.now().uptimeNanoseconds
+                let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                    as? [[SCStreamFrameInfo: Any]])?.first
+                let status = (attachments?[.status] as? Int).flatMap(SCFrameStatus.init(rawValue:))
+                onPortableSample?(sampleBuffer, status, attachments, arrived)
+                guard status == .complete, CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
                 onCapturedFrame?(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
                 videoEncoder?.encode(sampleBuffer: sampleBuffer)
                 return

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 
-final class SessionTrace {
+// Events are written by capture, encode, presentation and network callbacks.
+final class SessionTrace: @unchecked Sendable {
     private struct Event {
         let kind: String
         let pts: UInt64
@@ -15,9 +16,9 @@ final class SessionTrace {
     private let directory: URL
     private let mode: String
 
-    init(directory: URL, width: Int, height: Int, codec: StreamCodec, refresh: Double) {
+    init(directory: URL, width: Int, height: Int, codec: StreamCodec, refresh: Double, settings: String) {
         self.directory = directory
-        mode = "\(width)x\(height) codec=\(codec.rawValue) refresh_hz=\(refresh)"
+        mode = "\(width)x\(height) codec=\(codec.rawValue) refresh_hz=\(refresh) \(settings)"
     }
 
     func record(_ kind: String, _ pts: UInt64 = 0, _ value: Int = 0,

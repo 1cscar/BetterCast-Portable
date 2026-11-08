@@ -19,30 +19,64 @@ printf 'let portableBuildCommit = "%s"\n' "$(git rev-parse HEAD)" > "$build/Buil
 entry="$host/PortableHostApp.swift"
 binary="$app/Contents/MacOS/BetterCastPortableHost"
 case "${1:-}" in
-    --loopback|--steady|--faults)
+    --loopback|--steady|--faults|--matrix)
         entry="scripts/portable-smoke/Loopback.swift"
         binary="$build/LocalSmoke"
         ;;
 esac
 xcrun swiftc -sdk "$sdk" -target "$target" -O -I "$build" \
     "$sender"/{Constants,VirtualDisplayManager,ScreenFit,ScreenRecorder,LegacyDisplayCapture,AudioEncoder,VideoEncoder,LogManager}.swift \
-    "$host"/{PortableHost,SessionTrace,MotionWindow}.swift "$build/BuildCommit.swift" "$entry" "$build/VirtualDisplay.o" -o "$binary"
+    "$host"/{PortableHost,SessionTrace,MotionWindow,MetalMotionView,PortablePerformance}.swift "$build/BuildCommit.swift" "$entry" "$build/VirtualDisplay.o" -o "$binary"
 if [[ "$binary" == "$build/LocalSmoke" ]]; then
     python="$(command -v python3)"
     "$python" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM'
     run_case() {
         local width="$1" height="$2" codec="$3" label="$4" scenario="$5" trace=""
+        local experiment="${6:-${PORTABLE_EXPERIMENT:-default}}"
         if [[ "$scenario" == steady ]]; then
             trace="$(mktemp -d "$build/$label.XXXXXX")"
         fi
-        "$binary" "$width" "$height" "$codec" "$python" scripts/portable-smoke/receive.py "$scenario" "$trace" \
-            2>&1 | tee "$build/$label-loopback.log"
+        PORTABLE_EXPERIMENT="$experiment" "$binary" "$width" "$height" "$codec" "$python" scripts/portable-smoke/receive.py "$scenario" "$trace" \
+            2>&1 | tee "$build/$label-loopback.log" || return
         if [[ -n "$trace" ]]; then
             "$python" scripts/portable-smoke/analyze.py "$trace"/host-*.csv "$trace/loopback.csv" --loopback \
                 | tee "$trace/summary.txt"
         fi
     }
-    if [[ "$1" == --faults ]]; then
+    if [[ "$1" == --matrix ]]; then
+        if [[ "${PORTABLE_MATRIX_RESUME:-0}" != 1 || ! -f "$build/matrix.tsv" ]]; then
+            printf 'case\texperiment\tstatus\n' > "$build/matrix.tsv"
+        fi
+        for row in \
+            '1920 1080 1 baseline-1080p default' \
+            '1920 1080 1 uncapped-1080p uncapped' \
+            '1920 1080 1 display-link-1080p display-link' \
+            '1920 1080 1 depth5-1080p depth5' \
+            '3840 2160 1 baseline-4k-h264 default' \
+            '3840 2160 1 low-latency-4k-h264 low-latency' \
+            '3840 2160 2 baseline-4k-hevc default' \
+            '2560 1440 1 baseline-1440p default' \
+            '1920 1080 1 metal-1080p metal-motion' \
+            '1920 1080 1 headroom-1080p headroom' \
+            '3840 2160 1 speed-4k-h264 speed' \
+            '3840 2160 1 delay0-4k-h264 delay0' \
+            '3840 2160 1 depth5-4k-h264 depth5' \
+            '3840 2160 1 bgra-4k-h264 bgra' \
+            '3840 2160 1 realtime-off-4k-h264 realtime-off' \
+            '3840 2160 1 reorder-4k-h264 reorder' \
+            '3840 2160 1 gop1-4k-h264 gop1'; do
+            read -r width height codec label experiment <<< "$row"
+            if [[ -n "${2:-}" && "$2" != "$label" ]]; then continue; fi
+            completed="$(printf '%s\t%s\tpass' "$label" "$experiment")"
+            if [[ "${PORTABLE_MATRIX_RESUME:-0}" == 1 ]] && rg -Fxq "$completed" "$build/matrix.tsv"; then continue; fi
+            if run_case "$width" "$height" "$codec" "$label" steady "$experiment"; then
+                status=pass
+            else
+                status=failed
+            fi
+            printf '%s\t%s\t%s\n' "$label" "$experiment" "$status" | tee -a "$build/matrix.tsv"
+        done
+    elif [[ "$1" == --faults ]]; then
         for scenario in wrong_code expired approval_timeout host_stop reset window_close; do
             run_case 1920 1080 1 "$scenario" "$scenario"
         done

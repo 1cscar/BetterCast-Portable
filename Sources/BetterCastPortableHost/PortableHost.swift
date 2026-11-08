@@ -1,3 +1,5 @@
+import CoreMedia
+import ScreenCaptureKit
 import AppKit
 import CryptoKit
 import Network
@@ -70,6 +72,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     private var recorder: ScreenRecorder?
     private var captureTask: Task<Void, Never>?
     private let traceDirectory: URL?
+    private let performance: PortablePerformance
     private var trace: SessionTrace?
     private var motionWindow: MotionWindow?
     @Published private(set) var canShowMotion = false
@@ -80,11 +83,13 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     private(set) var boundPort: UInt16?
 
     init(traceDirectory: URL? = nil, listenPort: UInt16 = 51823,
-         pairingSeconds: UInt64 = 300, approvalSeconds: UInt64 = 30) {
+         pairingSeconds: UInt64 = 300, approvalSeconds: UInt64 = 30,
+         performance: PortablePerformance = .init()) {
         self.traceDirectory = traceDirectory
         self.listenPort = listenPort
         self.pairingSeconds = pairingSeconds
         self.approvalSeconds = approvalSeconds
+        self.performance = performance
     }
     private var encoder: VideoEncoder?
     private var captured = CaptureCount()
@@ -204,9 +209,11 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         request = ""
         let width = peer.width
         let height = peer.height
+        var encoderSettings = performance.encoder
+        encoderSettings.logProperties = traceDirectory != nil
         let encoder = VideoEncoder(connectionId: UUID(), width: width, height: height,
-                                   bitrate: 20_000_000, expectedFPS: 60, keyframeIntervalSeconds: 2,
-                                   codec: peer.codec, requireHardware: true)
+                                   bitrate: 20_000_000, expectedFPS: 60, keyframeIntervalSeconds: performance.keyframeSeconds,
+                                   codec: peer.codec, requireHardware: true, portableSettings: encoderSettings)
         guard encoder.isReady else {
             reject(peer, "No hardware encoder for this codec and size. Try H.264 or a smaller mode.")
             return
@@ -269,17 +276,36 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         encoder.delegate = self
         let recorder = ScreenRecorder(videoEncoder: encoder, targetDisplayID: displayID, width: width,
                                       height: height, captureFPS: 60, strictDisplayCapture: true)
+        recorder.portableSettings = performance.capture
         if let traceDirectory {
-            trace = SessionTrace(directory: traceDirectory, width: width, height: height, codec: peer.codec, refresh: refresh)
+            trace = SessionTrace(directory: traceDirectory, width: width, height: height, codec: peer.codec,
+                                 refresh: refresh, settings: performance.description)
             trace?.record("approved")
             canShowMotion = true
         }
-        recorder.onCapturedFrame = { [captured, trace] pts in
-            captured.increment()
-            if let trace, let nanos = streamTimestampNanoseconds(pts) { trace.record("capture", nanos / 100) }
-        }
+        recorder.onCapturedFrame = { [captured] _ in captured.increment() }
         if let trace {
-            recorder.onCaptureStatus = { status in trace.record(status == .idle ? "idle" : "capture_other") }
+            var describedBuffer = false
+            recorder.onPortableSample = { sample, status, attachments, arrived in
+                guard status == .complete, let buffer = CMSampleBufferGetImageBuffer(sample) else {
+                    let event = status == .idle ? "idle" : (status == .blank ? "blank" : "capture_other")
+                    trace.record(event, 0, status?.rawValue ?? -1, at: arrived)
+                    return
+                }
+                guard let nanos = streamTimestampNanoseconds(CMSampleBufferGetPresentationTimeStamp(sample)) else { return }
+                let pts = nanos / 100
+                let rectCount = (attachments?[.dirtyRects] as? [Any])?.count ?? -1
+                trace.record("capture", pts, rectCount, at: arrived)
+                if let hostTime = (attachments?[.displayTime] as? NSNumber)?.uint64Value,
+                   let time = streamTimestampNanoseconds(CMClockMakeHostTimeFromSystemUnits(hostTime)) {
+                    trace.record("sck_display_time", pts, 0, at: time)
+                }
+                if !describedBuffer {
+                    describedBuffer = true
+                    print("Portable buffer: \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) fourcc=\(CVPixelBufferGetPixelFormatType(buffer)) planes=\(CVPixelBufferGetPlaneCount(buffer)) iosurface=\(CVPixelBufferGetIOSurface(buffer) != nil)")
+                }
+            }
+            encoder.onPortableTiming = { trace.record($0, $1, $2, at: $3) }
             encoder.onPortableBackpressure = { pts in
                 if let nanos = streamTimestampNanoseconds(pts) { trace.record("backpressure", nanos / 100) }
             }
@@ -300,7 +326,8 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                   ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
               }) else { return }
         motionWindow?.window.close()
-        motionWindow = MotionWindow(screen: screen) { trace.record("motion") }
+        motionWindow = MotionWindow(screen: screen, useDisplayLink: performance.useDisplayLink,
+                                    metalMotion: performance.metalMotion, trace: trace)
         canShowMotion = false
     }
 
@@ -326,6 +353,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
             completion?(false)
             return
         }
+        if videoPTS != 0 { trace?.record("sealed", videoPTS) }
         peer.sequence += 1
         if peer.pending == 0 { peer.lastProgress = DispatchTime.now().uptimeNanoseconds }
         peer.pending += 1
@@ -353,6 +381,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
             let trace = self.trace
             let pts = trace == nil ? 0 : data.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) / 100 }
             trace?.record("encode", pts, data.count, at: encodedAt)
+            trace?.record("seal_start", pts)
             self.send(Data([1]) + data, to: peer, videoPTS: pts) { sent in
                 trace?.record(sent ? "tcp_processed" : "tcp_error", pts)
                 encoder.sendFinished()

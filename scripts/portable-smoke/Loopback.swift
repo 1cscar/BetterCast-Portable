@@ -28,7 +28,8 @@ struct LocalSmoke {
         guard CGPreflightScreenCaptureAccess() else { print("FAIL Screen Recording denied"); exit(1) }
         let host = PortableHost(traceDirectory: directory.isEmpty ? nil : URL(fileURLWithPath: directory),
                                 listenPort: 0, pairingSeconds: scenario == "expired" ? 2 : 300,
-                                approvalSeconds: scenario == "approval_timeout" ? 2 : 30)
+                                approvalSeconds: scenario == "approval_timeout" ? 2 : 30,
+                                performance: PortablePerformance(experiment: ProcessInfo.processInfo.environment["PORTABLE_EXPERIMENT"] ?? "default"))
         func displayID(_ screen: NSScreen) -> UInt32? {
             (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
         }
@@ -91,7 +92,7 @@ struct LocalSmoke {
             host.showMotion()
             motion = nil
         } else {
-            motion = MotionWindow(screen: screen) {}
+            motion = MotionWindow(screen: screen)
             precondition(motion?.window.screen == screen, "Test window is outside virtual display")
         }
         if scenario == "host_stop" || scenario == "window_close" {

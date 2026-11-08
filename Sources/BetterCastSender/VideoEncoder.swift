@@ -21,10 +21,20 @@ protocol VideoEncoderDelegate: AnyObject {
     func videoEncoder(_ encoder: VideoEncoder, didEncode data: Data, for connectionId: UUID, isKeyframe: Bool)
 }
 
+struct PortableEncoderSettings {
+    var lowLatencyRateControl = false
+    var realTime = true
+    var allowReordering = false
+    var maxFrameDelay = 1
+    var prioritizeSpeed = false
+    var logProperties = false
+}
+
 class VideoEncoder {
     weak var delegate: VideoEncoderDelegate?
     let connectionId: UUID
     var onPortableBackpressure: ((CMTime) -> Void)?
+    var onPortableTiming: ((String, UInt64, Int, UInt64) -> Void)?
     private var compressionSession: VTCompressionSession?
     var isReady: Bool { compressionSession != nil }
 
@@ -147,7 +157,7 @@ class VideoEncoder {
     // every parameter-set read used the HEVC API. Those return nothing for an H.264
     // description, so no VPS/SPS/PPS was ever cached or bundled and the receiver sat on a
     // black screen with no way to configure its decoder.
-    init(connectionId: UUID, width: Int, height: Int, bitrate: Int = 20_000_000, expectedFPS: Int = 120, keyframeIntervalSeconds: Double = 10.0, rateLimitWindow: Double = 1.0, codec: StreamCodec = .h264, requireHardware: Bool = false) {
+    init(connectionId: UUID, width: Int, height: Int, bitrate: Int = 20_000_000, expectedFPS: Int = 120, keyframeIntervalSeconds: Double = 10.0, rateLimitWindow: Double = 1.0, codec: StreamCodec = .h264, requireHardware: Bool = false, portableSettings: PortableEncoderSettings = .init()) {
         self.codec = codec
         self.connectionId = connectionId
         self.bitrate = bitrate
@@ -156,15 +166,15 @@ class VideoEncoder {
         self.expectedFPS = expectedFPS
         self.keyframeThrottleInterval = max(0.3, keyframeIntervalSeconds / 3.0) // Allow forced keyframes at 1/3 the interval
         
-        let specification = requireHardware
-            ? [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
-            : nil
+        var specification: [CFString: Bool] = [:]
+        if requireHardware { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
+        if portableSettings.lowLatencyRateControl { specification[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true }
         let status = VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width),
             height: Int32(height),
             codecType: codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-            encoderSpecification: specification,
+            encoderSpecification: specification.isEmpty ? nil : specification as CFDictionary,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: { (outputCallbackRefCon, _, status, flags, sampleBuffer) in
@@ -184,9 +194,12 @@ class VideoEncoder {
         guard let session = compressionSession else { return }
         
         // Configuration for Low-Latency Real-Time Encoding
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel
+        var propertyResults: [CFString: OSStatus] = [:]
+        func setProperty(_ key: CFString, _ value: CFTypeRef) {
+            propertyResults[key] = VTSessionSetProperty(session, key: key, value: value)
+        }
+        setProperty(kVTCompressionPropertyKey_RealTime, portableSettings.realTime ? kCFBooleanTrue : kCFBooleanFalse)
+        setProperty(kVTCompressionPropertyKey_ProfileLevel, codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel
                                                    : kVTProfileLevel_H264_High_AutoLevel)
         
         let bitrateCF = bitrate as CFNumber
@@ -195,7 +208,7 @@ class VideoEncoder {
         let bytesPerWindow = Int(Double(bitrate / 8) * burstMultiplier * rateLimitWindow)
         let limitCF = [bytesPerWindow, rateLimitWindow] as CFArray
 
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateCF)
+        setProperty(kVTCompressionPropertyKey_AverageBitRate, bitrateCF)
         // Applied on every path, with the window and the burst allowance doing the
         // tuning rather than the cap being present or absent.
         //
@@ -207,24 +220,37 @@ class VideoEncoder {
         // not, so the link saturates and frames queue, which is felt as seconds of lag
         // rather than as a bitrate problem. A generous ceiling still leaves motion its
         // detail while bounding the worst case.
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limitCF)
+        setProperty(kVTCompressionPropertyKey_DataRateLimits, limitCF)
         
         // Keyframe Control — shorter interval = faster error recovery at cost of bandwidth
         let maxKeyFrameInterval = Int(keyframeIntervalSeconds * Double(expectedFPS))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: maxKeyFrameInterval as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: keyframeIntervalSeconds as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Crucial for Real-Time
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: expectedFPS as CFNumber)
+        setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval, maxKeyFrameInterval as CFNumber)
+        setProperty(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, keyframeIntervalSeconds as CFNumber)
+        setProperty(kVTCompressionPropertyKey_AllowFrameReordering, portableSettings.allowReordering ? kCFBooleanTrue : kCFBooleanFalse)
+        setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, expectedFPS as CFNumber)
         // Emit each frame as soon as it's encoded — no rate-control lookahead buffering.
         // With no frame reordering this is safe and shaves a frame of latency off interactive
         // use (e.g. typing on an extended display mirrored to the receiver).
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
+        setProperty(kVTCompressionPropertyKey_MaxFrameDelayCount, portableSettings.maxFrameDelay as CFNumber)
+        if portableSettings.prioritizeSpeed {
+            setProperty(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)
+        }
 
         let preparation = VTCompressionSessionPrepareToEncodeFrames(session)
         if requireHardware && preparation != noErr {
             LogManager.shared.log("VideoEncoder: Hardware encoder preparation failed \(preparation)")
             invalidate()
             return
+        }
+        if portableSettings.logProperties {
+            let keys = Array(propertyResults.keys) + [kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                                       kVTCompressionPropertyKey_EncoderID, kVTCompressionPropertyKey_NumberOfPendingFrames]
+            for key in keys.sorted(by: { ($0 as String) < ($1 as String) }) {
+                var result: Unmanaged<CFTypeRef>?
+                let read = VTSessionCopyProperty(session, key: key, allocator: nil, valueOut: &result)
+                let value = result?.takeRetainedValue()
+                print("Portable VT \(key) set=\(propertyResults[key].map(String.init) ?? "n/a") read=\(read) value=\(value.map(String.init(describing:)) ?? "n/a")")
+            }
         }
         LogManager.shared.log("VideoEncoder: Initialized (\(codec == .hevc ? "H.265" : "H.264"), \(bitrate/1_000_000)Mbps, KF every \(keyframeIntervalSeconds)s)")
     }
@@ -399,6 +425,9 @@ class VideoEncoder {
         captureTimesNs[pts.value] = DispatchTime.now().uptimeNanoseconds
         captureTimesLock.unlock()
 
+        let trace = onPortableTiming
+        let tracePTS = trace == nil ? 0 : (streamTimestampNanoseconds(pts) ?? 0) / 100
+        trace?("vt_submit", tracePTS, 0, DispatchTime.now().uptimeNanoseconds)
         let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: imageBuffer,
@@ -409,18 +438,22 @@ class VideoEncoder {
             infoFlagsOut: nil
         )
         
+        trace?("vt_return", tracePTS, Int(status), DispatchTime.now().uptimeNanoseconds)
         if status != noErr {
              LogManager.shared.log("VideoEncoder: Encode failed \(status)")
         }
     }
     
     private func compressionCallback(status: OSStatus, flags: VTEncodeInfoFlags, sampleBuffer: CMSampleBuffer?) {
-        guard let sampleBuffer = sampleBuffer, status == noErr else {
+        guard let sampleBuffer, status == noErr else {
+            onPortableTiming?("vt_drop_or_error", 0, status == noErr ? Int(flags.rawValue) : Int(status),
+                              DispatchTime.now().uptimeNanoseconds)
             return
         }
-        
-        // Extract timestamp
         let presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let trace = onPortableTiming
+        let tracePTS = trace == nil ? 0 : (streamTimestampNanoseconds(presentationTimeStamp) ?? 0) / 100
+        trace?("vt_output", tracePTS, 0, DispatchTime.now().uptimeNanoseconds)
 
         // Age = capture to emit, matching how SideScreen measures it.
         captureTimesLock.lock()
@@ -435,6 +468,7 @@ class VideoEncoder {
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let isKeyframe = !notSync
+        if isKeyframe { trace?("vt_keyframe", tracePTS, 0, DispatchTime.now().uptimeNanoseconds) }
         
         // 1. Extract and Cache Headers from this frame if present
         if let description = CMSampleBufferGetFormatDescription(sampleBuffer) {
