@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#include "Transport.h"
+#include "SessionTrace.h"
 #include <d3d11_4.h>
 #include <dxgi1_3.h>
 #include <mfapi.h>
@@ -55,10 +55,16 @@ inline ComPtr<IMFTransform> createDecoder(bool hevc) {
     return decoder;
 }
 
+struct FrameCounts {
+    uint64_t decoded = 0;
+    uint64_t presented = 0;
+    void add(FrameCounts counts) { decoded += counts.decoded; presented += counts.presented; }
+};
+
 class Playback {
 public:
-    Playback(HWND window, UINT width, UINT height, bool hevc)
-        : expectedWidth(width), expectedHeight(height), decoder(createDecoder(hevc)) {
+    Playback(HWND window, UINT width, UINT height, bool hevc, SessionTrace& trace)
+        : expectedWidth(width), expectedHeight(height), trace(trace), decoder(createDecoder(hevc)) {
         check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                                nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context),
@@ -73,6 +79,11 @@ public:
         check(dxgi->SetMaximumFrameLatency(1), "Could not limit presentation queue");
         ComPtr<IDXGIAdapter> adapter;
         check(dxgi->GetAdapter(&adapter), "DXGI adapter unavailable");
+        DXGI_ADAPTER_DESC adapterDesc{};
+        if (SUCCEEDED(adapter->GetDesc(&adapterDesc))) {
+            trace.record("gpu_vendor_id", 0, adapterDesc.VendorId);
+            trace.record("gpu_device_id", 0, adapterDesc.DeviceId);
+        }
         ComPtr<IDXGIFactory2> factory;
         check(adapter->GetParent(IID_PPV_ARGS(&factory)), "DXGI factory unavailable");
         RECT client{};
@@ -116,8 +127,8 @@ public:
         check(decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Could not start video stream");
     }
 
-    int decode(Bytes& video) {
-        const LONGLONG pts = annexB(video);
+    FrameCounts decode(Bytes& video, LONGLONG pts) {
+        annexB(video);
         const DWORD size = DWORD(video.size() - 9);
         ComPtr<IMFSample> input;
         ComPtr<IMFMediaBuffer> buffer;
@@ -131,14 +142,15 @@ public:
         check(input->AddBuffer(buffer.Get()), "Could not attach compressed video");
         check(input->SetSampleTime(pts), "Could not set video timestamp");
 
-        int presented = 0;
+        FrameCounts counts;
         auto result = decoder->ProcessInput(0, input.Get(), 0);
         if (result == MF_E_NOTACCEPTING) {
-            presented += drain();
+            counts.add(drain());
             result = decoder->ProcessInput(0, input.Get(), 0);
         }
         check(result, "Decoder rejected a video access unit");
-        return presented + drain();
+        counts.add(drain());
+        return counts;
     }
 
     const char* outputPath() const { return surfacePath ? "DXGI surfaces" : "NV12 upload"; }
@@ -147,6 +159,7 @@ private:
     UINT expectedWidth, expectedHeight, outputWidth = 0, outputHeight = 0;
     UINT decodedWidth = 0, decodedHeight = 0;
     bool surfacePath = false;
+    SessionTrace& trace;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11VideoDevice> videoDevice;
@@ -210,8 +223,8 @@ private:
         videoContext->VideoProcessorSetStreamAutoProcessingMode(processor.Get(), 0, FALSE);
     }
 
-    int drain() {
-        int presented = 0;
+    FrameCounts drain() {
+        FrameCounts counts;
         for (;;) {
             ComPtr<IMFSample> allocated;
             if (!(outputInfo.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
@@ -229,11 +242,16 @@ private:
             events.Attach(output.pEvents);
             ComPtr<IMFSample> sample = allocated;
             if (output.pSample != allocated.Get()) sample.Attach(output.pSample);
-            if (result == MF_E_TRANSFORM_NEED_MORE_INPUT) return presented;
+            if (result == MF_E_TRANSFORM_NEED_MORE_INPUT) return counts;
             if (result == MF_E_TRANSFORM_STREAM_CHANGE) { selectOutput(); continue; }
             check(result, "Decoding failed");
+            if (output.dwStatus == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE) return counts;
             if (!sample) throw std::runtime_error("Decoder returned no video sample.");
-            if (present(sample.Get())) ++presented;
+            LONGLONG pts = 0;
+            if (trace.enabled() && FAILED(sample->GetSampleTime(&pts))) pts = 0;
+            trace.record("decoded", pts);
+            ++counts.decoded;
+            if (present(sample.Get(), pts)) ++counts.presented;
         }
     }
 
@@ -265,7 +283,7 @@ private:
         }
     }
 
-    bool present(IMFSample* sample) {
+    bool present(IMFSample* sample, LONGLONG pts) {
         ComPtr<IMFMediaBuffer> buffer;
         check(sample->GetBufferByIndex(0, &buffer), "Could not get decoded buffer");
         ComPtr<IMFDXGIBuffer> dxgi;
@@ -290,6 +308,7 @@ private:
         stream.pInputSurface = input.Get();
         check(videoContext->VideoProcessorBlt(processor.Get(), outputView.Get(), 0, 1, &stream), "Video render failed");
         const auto result = chain->Present(0, 0);
+        trace.record(result == S_OK ? "present" : "present_other", pts, static_cast<uint32_t>(result));
         check(result, "Video presentation failed");
         return result == S_OK;
     }

@@ -3,7 +3,6 @@ import CryptoKit
 import Network
 import SwiftUI
 
-private let port: UInt16 = 51823
 private let maxFrame = 8 * 1024 * 1024
 private let protocolLabel = Data("BetterCast Portable v1".utf8)
 
@@ -69,6 +68,24 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     private var timer: Timer?
     private var display: VirtualDisplayManager?
     private var recorder: ScreenRecorder?
+    private var captureTask: Task<Void, Never>?
+    private let traceDirectory: URL?
+    private var trace: SessionTrace?
+    private var motionWindow: MotionWindow?
+    @Published private(set) var canShowMotion = false
+
+    private let listenPort: UInt16
+    private let pairingSeconds: UInt64
+    private let approvalSeconds: UInt64
+    private(set) var boundPort: UInt16?
+
+    init(traceDirectory: URL? = nil, listenPort: UInt16 = 51823,
+         pairingSeconds: UInt64 = 300, approvalSeconds: UInt64 = 30) {
+        self.traceDirectory = traceDirectory
+        self.listenPort = listenPort
+        self.pairingSeconds = pairingSeconds
+        self.approvalSeconds = approvalSeconds
+    }
     private var encoder: VideoEncoder?
     private var captured = CaptureCount()
     private var encoded = 0
@@ -88,17 +105,26 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         do {
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
-            let listener = try NWListener(using: NWParameters(tls: nil, tcp: tcp), on: NWEndpoint.Port(rawValue: port)!)
+            // A successful local write only hands bytes to TCP. Bound retransmission
+            // and idle probes so a silently unplugged receiver can release the display.
+            tcp.connectionDropTime = 8
+            tcp.enableKeepalive = true
+            tcp.keepaliveIdle = 5
+            tcp.keepaliveInterval = 2
+            tcp.keepaliveCount = 3
+            let endpointPort: NWEndpoint.Port = listenPort == 0 ? .any : NWEndpoint.Port(rawValue: listenPort)!
+            let listener = try NWListener(using: NWParameters(tls: nil, tcp: tcp), on: endpointPort)
             self.listener = listener
             secret = bytes
-            expires = DispatchTime.now().uptimeNanoseconds + 300_000_000_000
+            expires = DispatchTime.now().uptimeNanoseconds + pairingSeconds * 1_000_000_000
             listener.newConnectionHandler = { [weak self] in self?.accept($0) }
             listener.stateUpdateHandler = { [weak self, weak listener] state in
                 guard let self, self.listener === listener else { return }
                 switch state {
                 case .ready:
                     self.code = self.secret?.map { String(format: "%02x", $0) }.joined() ?? ""
-                    self.status = "Listening on TCP \(port). Code expires in 5 minutes."
+                    self.boundPort = listener?.port?.rawValue
+                    self.status = "Listening on TCP \(self.boundPort ?? self.listenPort). Code expires in \(self.pairingSeconds) seconds."
                 case .failed(let error):
                     self.stop("Could not listen: \(error.localizedDescription)")
                 default: break
@@ -107,7 +133,9 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
             listener.start(queue: .main)
             busy = true
             lastTick = DispatchTime.now().uptimeNanoseconds
-            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+            self.timer = timer
+            RunLoop.main.add(timer, forMode: .common)
         } catch {
             stop("Could not listen: \(error.localizedDescription)")
         }
@@ -210,7 +238,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                 guard let self, let peer, self.peer === peer, !peer.ending else { return }
                 if let mode = self.activateMode(id, width: width, height: height) {
                     print("Portable extension id=\(id) mode=\(mode.pixelWidth)x\(mode.pixelHeight) points=\(mode.width)x\(mode.height) refresh=\(mode.refreshRate) mirror=0")
-                    self.startCapture(encoder, peer: peer, displayID: id)
+                    self.startCapture(encoder, peer: peer, displayID: id, refresh: mode.refreshRate)
                     return
                 }
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -232,7 +260,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         return nil
     }
 
-    private func startCapture(_ encoder: VideoEncoder, peer: Peer, displayID: CGDirectDisplayID) {
+    private func startCapture(_ encoder: VideoEncoder, peer: Peer, displayID: CGDirectDisplayID, refresh: Double) {
         let width = peer.width
         let height = peer.height
         captured = CaptureCount()
@@ -241,7 +269,21 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         encoder.delegate = self
         let recorder = ScreenRecorder(videoEncoder: encoder, targetDisplayID: displayID, width: width,
                                       height: height, captureFPS: 60, strictDisplayCapture: true)
-        recorder.onCapturedFrame = { [captured] in captured.increment() }
+        if let traceDirectory {
+            trace = SessionTrace(directory: traceDirectory, width: width, height: height, codec: peer.codec, refresh: refresh)
+            trace?.record("approved")
+            canShowMotion = true
+        }
+        recorder.onCapturedFrame = { [captured, trace] pts in
+            captured.increment()
+            if let trace, let nanos = streamTimestampNanoseconds(pts) { trace.record("capture", nanos / 100) }
+        }
+        if let trace {
+            recorder.onCaptureStatus = { status in trace.record(status == .idle ? "idle" : "capture_other") }
+            encoder.onPortableBackpressure = { pts in
+                if let nanos = streamTimestampNanoseconds(pts) { trace.record("backpressure", nanos / 100) }
+            }
+        }
         recorder.onStreamStopped = { [weak self, weak peer] in
             if let peer { self?.reject(peer, "Capture stopped or failed. Check macOS Screen Recording permission.") }
         }
@@ -249,7 +291,17 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         peer.started = DispatchTime.now().uptimeNanoseconds
         status = "Starting \(width) × \(height) at a 60 FPS target. Arrange the display in System Settings."
         send(Data([4]), to: peer)
-        Task { await recorder.startCapture() }
+        captureTask = Task { await recorder.startCapture() }
+    }
+
+    @MainActor func showMotion() {
+        guard let trace, let id = display?.displayID,
+              let screen = NSScreen.screens.first(where: {
+                  ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
+              }) else { return }
+        motionWindow?.window.close()
+        motionWindow = MotionWindow(screen: screen) { trace.record("motion") }
+        canShowMotion = false
     }
 
     func deny() {
@@ -261,24 +313,25 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         peer.ending = true
         request = ""
         status = reason
-        send(Data([3]) + Data(reason.utf8), to: peer) { [weak self, weak peer] in
+        send(Data([3]) + Data(reason.utf8), to: peer) { [weak self, weak peer] _ in
             if let peer { self?.end(peer, reason) }
         }
     }
 
-    private func send(_ plain: Data, to peer: Peer, completion: (() -> Void)? = nil) {
-        guard self.peer === peer, let key = peer.serverKey else { completion?(); return }
+    private func send(_ plain: Data, to peer: Peer, videoPTS: UInt64 = 0, completion: ((Bool) -> Void)? = nil) {
+        guard self.peer === peer, let key = peer.serverKey else { completion?(false); return }
         guard plain.count + 16 <= maxFrame, peer.sequence < UInt64(UInt32.max),
               let packet = try? seal(plain, key: key, sequence: peer.sequence) else {
             end(peer, "Could not encrypt the next packet.")
-            completion?()
+            completion?(false)
             return
         }
         peer.sequence += 1
         if peer.pending == 0 { peer.lastProgress = DispatchTime.now().uptimeNanoseconds }
         peer.pending += 1
+        if videoPTS != 0 { trace?.record("tcp_submit", videoPTS) }
         peer.socket.send(content: packet, completion: .contentProcessed { [weak self, weak peer] error in
-            completion?()
+            completion?(error == nil)
             guard let self, let peer, self.peer === peer else { return }
             peer.pending -= 1
             peer.lastProgress = DispatchTime.now().uptimeNanoseconds
@@ -287,6 +340,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     }
 
     func videoEncoder(_ encoder: VideoEncoder, didEncode data: Data, for connectionId: UUID, isKeyframe: Bool) {
+        let encodedAt = DispatchTime.now().uptimeNanoseconds
         encoder.sendStarted()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.encoder === encoder, let peer = self.peer, !peer.ending else { encoder.sendFinished(); return }
@@ -296,7 +350,13 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                 peer.seenVideo = true
                 self.status = "Streaming \(peer.width) × \(peer.height) · \(peer.codec.displayName) · direct TCP"
             }
-            self.send(Data([1]) + data, to: peer) { encoder.sendFinished() }
+            let trace = self.trace
+            let pts = trace == nil ? 0 : data.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) / 100 }
+            trace?.record("encode", pts, data.count, at: encodedAt)
+            self.send(Data([1]) + data, to: peer, videoPTS: pts) { sent in
+                trace?.record(sent ? "tcp_processed" : "tcp_error", pts)
+                encoder.sendFinished()
+            }
         }
     }
 
@@ -308,7 +368,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         guard let peer else { return }
         let age = now - peer.started
         if peer.serverKey == nil, age > 5_000_000_000 { end(peer, "Pairing handshake timed out."); return }
-        if !request.isEmpty, age > 30_000_000_000 { reject(peer, "Mac approval timed out."); return }
+        if !request.isEmpty, age > approvalSeconds * 1_000_000_000 { reject(peer, "Mac approval timed out."); return }
         if peer.pending > 0, now - peer.lastProgress > 5_000_000_000 {
             end(peer, "Direct connection stalled. Extension removed.")
             return
@@ -342,11 +402,22 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
 
     func stop(_ message: String = "Stopped. Generate a new code to reconnect.") {
         let oldID = display?.displayID
+        let trace = self.trace
+        self.trace = nil
+        canShowMotion = false
+        trace?.record("stop_requested")
+        let motion = motionWindow
+        Task { @MainActor in motion?.stop() }
+        captureTask?.cancel()
         if let recorder {
-            recorder.stopCapture()
+            recorder.stopCapture(after: captureTask) {
+                trace?.record("capture_stopped")
+                trace?.save()
+            }
         } else {
             encoder?.invalidate()
         }
+        captureTask = nil
         recorder = nil
         encoder = nil
         display?.destroyDisplay()
@@ -356,6 +427,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         peer = nil
         listener?.cancel()
         listener = nil
+        boundPort = nil
         timer?.invalidate()
         timer = nil
         secret = nil

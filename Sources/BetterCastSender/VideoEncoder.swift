@@ -11,6 +11,12 @@ enum StreamCodec: String, CaseIterable, Identifiable {
     var displayName: String { self == .hevc ? "H.265 (HEVC)" : "H.264" }
 }
 
+func streamTimestampNanoseconds(_ pts: CMTime) -> UInt64? {
+    let nanos = pts.seconds * 1e9
+    guard nanos >= 0, nanos < Double(UInt64.max) else { return nil }
+    return UInt64(nanos)
+}
+
 protocol VideoEncoderDelegate: AnyObject {
     func videoEncoder(_ encoder: VideoEncoder, didEncode data: Data, for connectionId: UUID, isKeyframe: Bool)
 }
@@ -18,6 +24,7 @@ protocol VideoEncoderDelegate: AnyObject {
 class VideoEncoder {
     weak var delegate: VideoEncoderDelegate?
     let connectionId: UUID
+    var onPortableBackpressure: ((CMTime) -> Void)?
     private var compressionSession: VTCompressionSession?
     var isReady: Bool { compressionSession != nil }
 
@@ -353,6 +360,7 @@ class VideoEncoder {
         if frameCount > 0 && !pendingKeyFrameRequest && sendsInFlight >= 2 {
             adaptFrames += 1
             adaptDrops += 1
+            onPortableBackpressure?(pts)
             return
         }
         frameCount += 1
@@ -500,7 +508,8 @@ class VideoEncoder {
         if !coalescedData.isEmpty {
              var packetWithPTS = Data()
              // Convert PTS to UInt64 nanoseconds (8 bytes)
-             var ptsNanos = UInt64(presentationTimeStamp.seconds * 1_000_000_000)
+             guard let nanos = streamTimestampNanoseconds(presentationTimeStamp) else { return }
+             var ptsNanos = nanos.littleEndian
              packetWithPTS.append(Data(bytes: &ptsNanos, count: 8))
              packetWithPTS.append(coalescedData)
             

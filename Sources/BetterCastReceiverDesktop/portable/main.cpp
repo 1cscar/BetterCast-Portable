@@ -88,6 +88,7 @@ struct Session {
     std::wstring message;
     WINDOWPLACEMENT placement{};
     bool closeOnFinish = false;
+    bool traceEnabled = false;
     bool showMetrics = false;
     bool receivedVideo = false;
     int exitKey = 0;
@@ -106,10 +107,14 @@ struct Session {
     }
 
     void receive(std::wstring ip, Bytes secret, UINT width, UINT height, bool hevc) {
+        std::wstring traceNotice;
         try {
+            SessionTrace trace(traceEnabled, width, height, hevc);
+            if (trace.enabled()) traceNotice = L"  Trace: " + trace.path.filename().wstring();
+            trace.record("connect");
             WinsockRuntime sockets;
             MediaRuntime media;
-            Playback playback(window, width, height, hevc);
+            Playback playback(window, width, height, hevc, trace);
             Connection connection(stop);
             connection.dial(ip);
             auto transcript = connection.read(32, Clock::now() + 5s);
@@ -129,7 +134,8 @@ struct Session {
             connection.write(clientNonce);
             report(L"Waiting for approval on the Mac…");
             bool approved = false;
-            uint64_t sequence = 0, frames = 0, presented = 0, bytes = 0;
+            uint64_t sequence = 0, frames = 0, bytes = 0;
+            FrameCounts counts;
             auto stats = Clock::now();
             auto deadline = stats + 40s;
             while (!stop) {
@@ -138,22 +144,27 @@ struct Session {
                 if (length < 17 || length > MaxPacket || sequence >= UINT32_MAX)
                     throw std::runtime_error("Invalid encrypted packet length or sequence.");
                 auto ciphertext = connection.read(length, deadline);
+                const auto packetAt = trace.enabled() ? traceTime() : 0;
                 auto plain = receiver.crypt(ciphertext, sequence++, header, false);
                 if (plain[0] == 3 && plain.size() <= 513)
                     throw std::runtime_error(std::string(plain.begin() + 1, plain.end()));
                 if (!approved && plain[0] == 4 && plain.size() == 1) {
                     approved = true;
+                    trace.record("approved");
                     stats = Clock::now();
                     report(L"Approved. Waiting for the first frame…");
                 } else if (approved && plain[0] == 1) {
                     ++frames;
                     bytes += plain.size() - 1;
-                    const auto count = playback.decode(plain);
-                    if (count > 0 && !receivedVideo) {
+                    const auto pts = videoPTS(plain);
+                    trace.record("tcp_read", pts, 0, packetAt);
+                    trace.record("rx", pts, int64_t(plain.size() - 1));
+                    const auto frame = playback.decode(plain, pts);
+                    if (frame.presented > 0 && !receivedVideo) {
                         receivedVideo = true;
                         PostMessageW(window, StatusUpdate, 1, 0);
                     }
-                    presented += count;
+                    counts.add(frame);
                 } else if (!approved || plain[0] != 2 || plain.size() != 1) {
                     throw std::runtime_error("Invalid packet type for this session.");
                 }
@@ -162,20 +173,23 @@ struct Session {
                 const auto seconds = std::chrono::duration<double>(now - stats).count();
                 if (approved && seconds >= 1) {
                     wchar_t line[256];
-                    swprintf_s(line, L"RX %.1f FPS · Present %.1f FPS · %.2f Mb/s · %ls · direct TCP",
-                               frames / seconds, presented / seconds, bytes * 8.0 / seconds / 1e6,
+                    swprintf_s(line, L"RX %.1f · Decode %.1f · Present %.1f FPS · %.2f Mb/s · %ls",
+                               frames / seconds, counts.decoded / seconds, counts.presented / seconds,
+                               bytes * 8.0 / seconds / 1e6,
                                wide(playback.outputPath()).c_str());
                     report(line);
                     stats = now;
-                    frames = presented = bytes = 0;
+                    frames = bytes = 0;
+                    counts = {};
                 }
             }
+            trace.record("stopped");
         } catch (const std::exception& error) {
             SecureZeroMemory(secret.data(), secret.size());
-            report(stop ? L"Disconnected." : wide(error.what()), SessionEnded);
+            report((stop ? L"Disconnected." : wide(error.what())) + traceNotice, SessionEnded);
             return;
         }
-        report(L"Disconnected.", SessionEnded);
+        report(L"Disconnected." + traceNotice, SessionEnded);
     }
 
     HWND control(const wchar_t* type, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id = 0) {
@@ -368,6 +382,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR args, int show) {
     if (!RegisterClassW(&cls)) return 1;
     Session session;
     session.instance = instance;
+    session.traceEnabled = std::wstring(args) == L"--trace";
     auto window = CreateWindowExW(0, ClassName, L"BetterCast Portable Receiver",
                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 495, 320, nullptr, nullptr, instance, &session);

@@ -27,7 +27,8 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var captureAudio: Bool = false
     /// Portable requires the requested virtual screen and forwards only real frames.
     let strictDisplayCapture: Bool
-    var onCapturedFrame: (() -> Void)?
+    var onCapturedFrame: ((CMTime) -> Void)?
+    var onCaptureStatus: ((SCFrameStatus?) -> Void)?
 
     /// When true, uses CGDisplayStream instead of ScreenCaptureKit to capture.
     /// CGDisplayStream reads the GPU's composited framebuffer directly, which bypasses
@@ -172,18 +173,21 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
     
-    func stopCapture() {
+    func stopCapture(after startup: Task<Void, Never>? = nil, onStopped: (() -> Void)? = nil) {
         stopRequested = true // Aborts an in-flight startCapture() that hasn't published its stream yet
         legacyCapture?.stop()
         legacyCapture = nil
         stopFramePump()
         Task {
+            // A pending ScreenCaptureKit start must finish before we issue stop.
+            await startup?.value
             try? await stream?.stopCapture()
             stream = nil
             if strictDisplayCapture {
                 // Wait for any sample already executing before invalidating its encoder.
                 portableSamples.sync { videoEncoder?.invalidate() }
             }
+            onStopped?()
         }
     }
 
@@ -373,13 +377,15 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         switch type {
         case .screen:
             if strictDisplayCapture {
-                guard !stopRequested,
-                      let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-                        as? [[SCStreamFrameInfo: Any]],
-                      let rawStatus = attachments.first?[.status] as? Int,
-                      SCFrameStatus(rawValue: rawStatus) == .complete,
-                      CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
-                onCapturedFrame?()
+                guard !stopRequested else { return }
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                    as? [[SCStreamFrameInfo: Any]]
+                let status = (attachments?.first?[.status] as? Int).flatMap(SCFrameStatus.init(rawValue:))
+                guard status == .complete, CMSampleBufferGetImageBuffer(sampleBuffer) != nil else {
+                    onCaptureStatus?(status)
+                    return
+                }
+                onCapturedFrame?(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
                 videoEncoder?.encode(sampleBuffer: sampleBuffer)
                 return
             }

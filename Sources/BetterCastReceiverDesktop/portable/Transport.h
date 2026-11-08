@@ -179,12 +179,16 @@ private:
     }
 };
 
-// Preserve BetterCast Mac sender's [8-byte little-endian ns PTS][4-byte BE length][NAL] payload.
-// Media Foundation consumes Annex B. Replace each length in place, without copying the access unit.
-inline LONGLONG annexB(Bytes& video) {
+inline LONGLONG videoPTS(const Bytes& video) {
     if (video.size() < 14 || video[0] != 1) throw std::runtime_error("Truncated video access unit.");
     uint64_t pts = 0;
     for (int i = 0; i < 8; ++i) pts |= uint64_t(video[i + 1]) << (8 * i);
+    return LONGLONG(pts / 100);
+}
+
+// Preserve BetterCast Mac sender's [8-byte little-endian ns PTS][4-byte BE length][NAL] payload.
+// Media Foundation consumes Annex B. Replace each length in place, without copying the access unit.
+inline void annexB(Bytes& video) {
     size_t offset = 9;
     while (offset < video.size()) {
         if (video.size() - offset < 4) throw std::runtime_error("Truncated NAL header.");
@@ -195,5 +199,4 @@ inline LONGLONG annexB(Bytes& video) {
         video[offset + 3] = 1;
         offset += 4 + length;
     }
-    return LONGLONG(pts / 100);
 }

@@ -20,7 +20,7 @@ jobs:
       - name: Build the receiver
         shell: pwsh
         run: |
-          cmake -S Sources/BetterCastReceiverDesktop/portable -B .build/portable-windows -A x64
+          cmake -S Sources/BetterCastReceiverDesktop/portable -B .build/portable-windows -A x64 "-DPORTABLE_BUILD_COMMIT=$env:GITHUB_SHA"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build .build/portable-windows --config Release
       - name: Package the executable and notices
@@ -28,6 +28,7 @@ jobs:
         run: |
           New-Item -Type Directory .build/portable-package | Out-Null
           Copy-Item .build/portable-windows/Release/BetterCastPortableReceiver.exe, LICENSE, ACKNOWLEDGMENTS.md .build/portable-package
+          Set-Content .build/portable-package/SOURCE-COMMIT.txt $env:GITHUB_SHA
           Get-FileHash .build/portable-package/BetterCastPortableReceiver.exe -Algorithm SHA256
       - uses: actions/upload-artifact@v6
         with:

@@ -2,7 +2,13 @@ import SwiftUI
 
 @main
 struct BetterCastPortableHostApp: App {
-    @StateObject private var host = PortableHost()
+    @StateObject private var host = PortableHost(traceDirectory: Self.traceDirectory)
+
+    private static var traceDirectory: URL? {
+        let args = CommandLine.arguments
+        guard let flag = args.firstIndex(of: "--trace-dir"), flag + 1 < args.count else { return nil }
+        return URL(fileURLWithPath: args[flag + 1], isDirectory: true)
+    }
 
     var body: some Scene {
         Window("BetterCast Portable Host", id: "portable-host") {
@@ -20,6 +26,9 @@ struct BetterCastPortableHostApp: App {
                     }
                 }
                 if !host.metrics.isEmpty { Text(host.metrics).monospacedDigit() }
+                if host.canShowMotion {
+                    Button("Start 72-second test motion") { host.showMotion() }
+                }
                 HStack {
                     Button("Generate pairing code") { host.pair() }.disabled(host.busy)
                     Button("Stop") { host.stop() }.disabled(!host.busy)
