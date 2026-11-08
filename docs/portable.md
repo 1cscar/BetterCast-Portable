@@ -51,6 +51,21 @@ Run on an unlocked Mac desktop with Screen Recording permission for the invoking
 
 The test builds the actual Host engine and runs real WindowServer, ScreenCaptureKit and hardware VideoToolbox. It opens a changing test window on the new display, verifies approval precedes display creation, authenticates actual encoded access units over localhost, checks frame timestamps and NAL lengths, then closes TCP and verifies the display disappears and the test window is visible on an original display. Logs are written under `.build/portable-host/*-loopback.log`. This is a Mac loopback check. The receiver script does not decode or present, and its FPS includes session startup.
 
+## Recorded evidence · 2026-11-08
+
+Apple M4, macOS 26.7.2 (25G320), Xcode 27.2. Each loopback sample spans about five seconds including startup.
+
+| Mode | Codec | Authenticated frames / unique PTS | Receive FPS | Video Mb/s |
+| --- | --- | ---: | ---: | ---: |
+| 1920 × 1080 | H.264 | 265 / 265 | 53.0 | 4.00 |
+| 2560 × 1440 | H.264 | 268 / 268 | 53.5 | 3.23 |
+| 3840 × 2160 | HEVC | 261 / 261 | 52.0 | 3.18 |
+| 3840 × 2160 | H.264 | 258 / 258 | 51.5 | 6.33 |
+
+Each mode was an independent 60 Hz virtual display. The four smoke cases also verified display removal and an ordinary visible window returning to the original display. This workload is a changing desktop window, with no Windows decode/presentation or network benchmark.
+
+The [Windows x64 run](https://github.com/1cscar/BetterCast-Portable/actions/runs/42451006381) at `b2ec4d1` verified the portable EXE's imports, launch, display query, H.264 transform activation and AES-GCM vector/tamper test. The [artifact](https://github.com/1cscar/BetterCast-Portable/actions/runs/42451006381/artifacts/13605388284) EXE has SHA-256 `c1eb419b8499ec25813292ad4a6f1578b4f6f9ed1e97646d4852b8e095a5f01c`.
+
 ## Gate boundaries
 
 - **G0:** [Upstream code and license audit](portable-g0.md).

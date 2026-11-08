@@ -5,7 +5,7 @@ struct BetterCastPortableHostApp: App {
     @StateObject private var host = PortableHost()
 
     var body: some Scene {
-        WindowGroup("BetterCast Portable Host") {
+        Window("BetterCast Portable Host", id: "portable-host") {
             VStack(alignment: .leading, spacing: 14) {
                 Text(host.status).font(.headline)
                 if !host.code.isEmpty {

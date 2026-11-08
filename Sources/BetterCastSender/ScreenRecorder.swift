@@ -4,13 +4,17 @@ import CoreMedia
 import QuartzCore
 
 class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
-    private var stream: SCStream?
+    private let lifecycleLock = NSLock()
+    private var activeStream: SCStream?
+    private var stream: SCStream? {
+        get { lifecycleLock.withLock { activeStream } }
+        set { lifecycleLock.withLock { activeStream = newValue } }
+    }
     // Set when stopCapture() is called. startCapture() runs async and spends up to ~2s
     // retrying to find the virtual display before it assigns `stream`. If a stop lands
     // during that window it would no-op on a nil stream and the about-to-start stream
     // would leak — capturing forever with no way to stop it. This flag lets an in-flight
     // start abort and tear itself down.
-    private let lifecycleLock = NSLock()
     private var stopped = false
     private var stopRequested: Bool {
         get { lifecycleLock.withLock { stopped } }
@@ -91,7 +95,7 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                       let mode = CGDisplayCopyDisplayMode(display.displayID),
                       mode.pixelWidth == width, mode.pixelHeight == height else {
                     LogManager.shared.log("ScreenRecorder: Independent target display is unavailable")
-                    DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
+                    notifyStreamStopped()
                     return
                 }
             }
@@ -159,7 +163,7 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             LogManager.shared.log("ScreenRecorder: Failed to start capture: \(error.localizedDescription)")
             self.stream = nil // Release a partially-created stream so it doesn't linger
             if strictDisplayCapture && !stopRequested {
-                DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
+                notifyStreamStopped()
             }
 
             if let scError = error as? SCStreamError, scError.code == .userDeclined {
@@ -177,7 +181,8 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             try? await stream?.stopCapture()
             stream = nil
             if strictDisplayCapture {
-                portableSamples.async { self.videoEncoder?.invalidate() }
+                // Wait for any sample already executing before invalidating its encoder.
+                portableSamples.sync { videoEncoder?.invalidate() }
             }
         }
     }
@@ -410,6 +415,10 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // until the user reconnected (#68). Hand it to the owner to restart.
         guard !stopRequested else { return }
         self.stream = nil
+        notifyStreamStopped()
+    }
+
+    private func notifyStreamStopped() {
         DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
     }
 }
