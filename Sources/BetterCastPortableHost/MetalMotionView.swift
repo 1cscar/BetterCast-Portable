@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import AppKit
 import Metal
-@preconcurrency import QuartzCore
+import QuartzCore
 
 /// A second real stimulus with observable presentation timestamps. Each frame
 /// redraws the entire drawable and contains a moving pattern and a serial marker.
 @MainActor
 final class MetalMotionView: NSView {
+    // The render queue only acquires drawables. The main queue updates size
+    // while holding drawableSlot, before dispatching the next acquisition.
+    private struct DrawableSource: @unchecked Sendable {
+        let layer: CAMetalLayer
+        func nextDrawable() -> CAMetalDrawable? { layer.nextDrawable() }
+    }
+
     private let metalLayer = CAMetalLayer()
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
@@ -49,13 +56,14 @@ final class MetalMotionView: NSView {
         if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
         serial += 1
         let frameNumber = serial
+        let source = DrawableSource(layer: metalLayer)
 
         // nextDrawable can wait for the compositor. Keep that wait off the
         // main queue, which also delivers encrypted transport completions.
-        renderQueue.async { [metalLayer, queue, pipeline, trace, drawableSlot] in
+        renderQueue.async { [source, queue, pipeline, trace, drawableSlot] in
             defer { drawableSlot.signal() }
             let begin = DispatchTime.now().uptimeNanoseconds
-            guard let drawable = metalLayer.nextDrawable(), let commands = queue.makeCommandBuffer() else {
+            guard let drawable = source.nextDrawable(), let commands = queue.makeCommandBuffer() else {
                 trace?.record("metal_no_drawable")
                 return
             }
