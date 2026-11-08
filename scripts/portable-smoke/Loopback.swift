@@ -105,7 +105,8 @@ struct LocalSmoke {
             }
         }
         await until("loopback client finishes", seconds: scenario == "steady" ? 80 : 15) { !client.isRunning }
-        guard client.terminationStatus == 0 else { print("FAIL loopback receiver exited \(client.terminationStatus)"); exit(1) }
+        let receiverFailed = client.terminationStatus != 0
+        if receiverFailed && host.busy { host.stop() }
         await until("virtual display removal") { CGDisplayIsOnline(id) != 1 && !host.busy }
         if let motion, scenario != "window_close" {
             await until("window rehomed") {
@@ -121,6 +122,10 @@ struct LocalSmoke {
                     $0.hasPrefix("host-") && $0.hasSuffix(".csv")
                 } == true
             }
+        }
+        if receiverFailed {
+            print("FAIL loopback receiver exited \(client.terminationStatus)")
+            exit(1)
         }
         print("PASS \(scenario) independent \(width)x\(height) codec=\(codec); approval and teardown verified")
         exit(0)

@@ -47,6 +47,8 @@ if [[ "$binary" == "$build/LocalSmoke" ]]; then
         if [[ "${PORTABLE_MATRIX_RESUME:-0}" != 1 || ! -f "$build/matrix.tsv" ]]; then
             printf 'case\texperiment\tstatus\n' > "$build/matrix.tsv"
         fi
+        matched=0
+        failures=0
         for row in \
             '1920 1080 1 baseline-1080p default' \
             '1920 1080 1 uncapped-1080p uncapped' \
@@ -67,15 +69,22 @@ if [[ "$binary" == "$build/LocalSmoke" ]]; then
             '3840 2160 1 gop1-4k-h264 gop1'; do
             read -r width height codec label experiment <<< "$row"
             if [[ -n "${2:-}" && "$2" != "$label" ]]; then continue; fi
+            matched=1
             completed="$(printf '%s\t%s\tpass' "$label" "$experiment")"
             if [[ "${PORTABLE_MATRIX_RESUME:-0}" == 1 ]] && /usr/bin/grep -Fxq "$completed" "$build/matrix.tsv"; then continue; fi
             if run_case "$width" "$height" "$codec" "$label" steady "$experiment"; then
                 status=pass
             else
                 status=failed
+                failures=$((failures + 1))
             fi
             printf '%s\t%s\t%s\n' "$label" "$experiment" "$status" | tee -a "$build/matrix.tsv"
         done
+        if [[ "$matched" == 0 ]]; then
+            printf 'Unknown matrix case: %s\n' "${2:-}" >&2
+            exit 2
+        fi
+        if [[ "$failures" != 0 ]]; then exit 1; fi
     elif [[ "$1" == --faults ]]; then
         for scenario in wrong_code expired approval_timeout host_stop reset window_close; do
             run_case 1920 1080 1 "$scenario" "$scenario"
