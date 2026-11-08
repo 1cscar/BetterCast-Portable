@@ -1,0 +1,60 @@
+name: Build Portable Windows Receiver
+
+on:
+  push:
+    paths:
+      - 'Sources/BetterCastReceiverDesktop/portable/**'
+      - '.github/workflows/build-portable-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build the receiver
+        shell: pwsh
+        run: |
+          cmake -S Sources/BetterCastReceiverDesktop/portable -B .build/portable-windows -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build .build/portable-windows --config Release
+      - name: Package the executable and notices
+        shell: pwsh
+        run: |
+          New-Item -Type Directory .build/portable-package | Out-Null
+          Copy-Item .build/portable-windows/Release/BetterCastPortableReceiver.exe, LICENSE, ACKNOWLEDGMENTS.md .build/portable-package
+          Get-FileHash .build/portable-package/BetterCastPortableReceiver.exe -Algorithm SHA256
+      - uses: actions/upload-artifact@v6
+        with:
+          name: BetterCastPortableReceiver-Windows-x64
+          path: .build/portable-package
+      - name: Verify PE imports, manifest and launch the actual app
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path .build/portable-package/BetterCastPortableReceiver.exe).Path
+          $kits = 'C:\Program Files (x86)\Windows Kits\10\bin'
+          $mt = (Get-ChildItem $kits -Recurse -Filter mt.exe | Where-Object { $_.Directory.Name -eq 'x64' } | Sort-Object FullName | Select-Object -Last 1).FullName
+          & $mt "-inputresource:$exe;#1" "-out:$env:RUNNER_TEMP\portable.manifest"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ((Get-Content "$env:RUNNER_TEMP\portable.manifest" -Raw) -notmatch 'level="asInvoker"') {
+            throw 'Receiver manifest does not declare asInvoker'
+          }
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
+          $imports = & $dumpbin /dependents $exe | Out-String
+          Write-Host $imports
+          if ($LASTEXITCODE -or $imports -match '(?im)^\s*(Qt\S*|avcodec\S*|avutil\S*|swscale\S*|VCRUNTIME\S*|MSVCP\S*)\.dll\s*$') {
+            throw 'Unexpected redistributable import or failed PE inspection'
+          }
+          $process = Start-Process -FilePath $exe -ArgumentList '--self-test' -PassThru
+          if (-not $process.WaitForExit(15000)) {
+            $process.Kill()
+            throw 'Receiver launch smoke test timed out'
+          }
+          if ($process.ExitCode) { throw "Receiver launch smoke test exit code $($process.ExitCode)" }
+          Write-Host 'Receiver window, display detection, H.264 transform activation, AES-GCM known answer and tamper rejection passed.'

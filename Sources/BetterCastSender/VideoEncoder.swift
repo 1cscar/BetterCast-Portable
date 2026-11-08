@@ -19,6 +19,15 @@ class VideoEncoder {
     weak var delegate: VideoEncoderDelegate?
     let connectionId: UUID
     private var compressionSession: VTCompressionSession?
+    var isReady: Bool { compressionSession != nil }
+
+    // Called after the Portable capture stream has stopped delivering samples.
+    func invalidate() {
+        if let session = compressionSession {
+            VTCompressionSessionInvalidate(session)
+            compressionSession = nil
+        }
+    }
     private var frameCount = 0
     private let bitrate: Int
     private let rateLimitWindow: Double
@@ -131,7 +140,7 @@ class VideoEncoder {
     // every parameter-set read used the HEVC API. Those return nothing for an H.264
     // description, so no VPS/SPS/PPS was ever cached or bundled and the receiver sat on a
     // black screen with no way to configure its decoder.
-    init(connectionId: UUID, width: Int, height: Int, bitrate: Int = 20_000_000, expectedFPS: Int = 120, keyframeIntervalSeconds: Double = 10.0, rateLimitWindow: Double = 1.0, codec: StreamCodec = .h264) {
+    init(connectionId: UUID, width: Int, height: Int, bitrate: Int = 20_000_000, expectedFPS: Int = 120, keyframeIntervalSeconds: Double = 10.0, rateLimitWindow: Double = 1.0, codec: StreamCodec = .h264, requireHardware: Bool = false) {
         self.codec = codec
         self.connectionId = connectionId
         self.bitrate = bitrate
@@ -140,12 +149,15 @@ class VideoEncoder {
         self.expectedFPS = expectedFPS
         self.keyframeThrottleInterval = max(0.3, keyframeIntervalSeconds / 3.0) // Allow forced keyframes at 1/3 the interval
         
+        let specification = requireHardware
+            ? [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
+            : nil
         let status = VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width),
             height: Int32(height),
             codecType: codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-            encoderSpecification: nil,
+            encoderSpecification: specification,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: { (outputCallbackRefCon, _, status, flags, sampleBuffer) in
@@ -201,7 +213,12 @@ class VideoEncoder {
         // use (e.g. typing on an extended display mirrored to the receiver).
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
 
-        VTCompressionSessionPrepareToEncodeFrames(session)
+        let preparation = VTCompressionSessionPrepareToEncodeFrames(session)
+        if requireHardware && preparation != noErr {
+            LogManager.shared.log("VideoEncoder: Hardware encoder preparation failed \(preparation)")
+            invalidate()
+            return
+        }
         LogManager.shared.log("VideoEncoder: Initialized (\(codec == .hevc ? "H.265" : "H.264"), \(bitrate/1_000_000)Mbps, KF every \(keyframeIntervalSeconds)s)")
     }
     

@@ -15,6 +15,9 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var targetDisplayID: CGDirectDisplayID?
     var audioEncoder: AudioEncoder?
     var captureAudio: Bool = false
+    /// Portable requires the requested virtual screen and forwards only real frames.
+    let strictDisplayCapture: Bool
+    var onCapturedFrame: (() -> Void)?
 
     /// When true, uses CGDisplayStream instead of ScreenCaptureKit to capture.
     /// CGDisplayStream reads the GPU's composited framebuffer directly, which bypasses
@@ -31,12 +34,13 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// typically because the Mac put its displays to sleep. The owner restarts it.
     var onStreamStopped: (() -> Void)?
 
-    init(videoEncoder: VideoEncoder, targetDisplayID: CGDirectDisplayID? = nil, width: Int = 1920, height: Int = 1080, captureFPS: Int32 = 120) {
+    init(videoEncoder: VideoEncoder, targetDisplayID: CGDirectDisplayID? = nil, width: Int = 1920, height: Int = 1080, captureFPS: Int32 = 120, strictDisplayCapture: Bool = false) {
         self.videoEncoder = videoEncoder
         self.targetDisplayID = targetDisplayID
         self.width = width
         self.height = height
         self.captureFPS = captureFPS
+        self.strictDisplayCapture = strictDisplayCapture
         super.init()
     }
     
@@ -44,7 +48,7 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         stopRequested = false
 
         // ── Legacy capture path (CGDisplayStream) ──
-        if useLegacyCapture {
+        if useLegacyCapture && !strictDisplayCapture {
             await startLegacyCapture()
             return
         }
@@ -66,11 +70,20 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     try await Task.sleep(nanoseconds: 200_000_000) // 200ms
                 }
                 
-                if display == nil {
+                if display == nil && !strictDisplayCapture {
                     LogManager.shared.log("ScreenRecorder: Target display \(targetID) NOT found after retries. Falling back to Main.")
                 }
             }
             
+            if strictDisplayCapture {
+                guard let display, display.displayID != CGMainDisplayID(),
+                      CGDisplayIsInMirrorSet(display.displayID) == 0 else {
+                    LogManager.shared.log("ScreenRecorder: Independent target display is unavailable")
+                    DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
+                    return
+                }
+            }
+
             // Fallback to Main Display explicitly if target not found or not specified
             if display == nil {
                  let content = try await SCShareableContent.current
@@ -96,7 +109,10 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             // Low queue depth = less capture-side buffering = lower input-to-display latency.
             // 4 instead of 3 because the frame pump retains the newest buffer from this pool;
             // SCK still has 3 free buffers in flight, so effective latency is unchanged.
-            config.queueDepth = captureFPS > 60 ? 8 : 4
+            config.queueDepth = strictDisplayCapture ? 3 : (captureFPS > 60 ? 8 : 4)
+            if strictDisplayCapture {
+                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            }
             config.capturesAudio = captureAudio
 
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -124,11 +140,14 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 return
             }
             LogManager.shared.log("ScreenRecorder: Started capture for display \(display.displayID)")
-            startFramePump()
+            if !strictDisplayCapture { startFramePump() }
 
         } catch {
             LogManager.shared.log("ScreenRecorder: Failed to start capture: \(error.localizedDescription)")
             self.stream = nil // Release a partially-created stream so it doesn't linger
+            if strictDisplayCapture && !stopRequested {
+                DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
+            }
 
             if let scError = error as? SCStreamError, scError.code == .userDeclined {
                  LogManager.shared.log("ScreenRecorder: PERMISSION DENIED. Go to System Settings > Privacy > Screen Recording")
@@ -144,6 +163,7 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         Task {
             try? await stream?.stopCapture()
             stream = nil
+            if strictDisplayCapture { videoEncoder?.invalidate() }
         }
     }
 
@@ -332,6 +352,16 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         switch type {
         case .screen:
+            if strictDisplayCapture {
+                guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                        as? [[SCStreamFrameInfo: Any]],
+                      let rawStatus = attachments.first?[.status] as? Int,
+                      SCFrameStatus(rawValue: rawStatus) == .complete,
+                      CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
+                onCapturedFrame?()
+                videoEncoder?.encode(sampleBuffer: sampleBuffer)
+                return
+            }
             frameCount += 1
             if frameCount % 300 == 0 {
                 LogManager.shared.log("ScreenRecorder: Captured frame \(frameCount)")

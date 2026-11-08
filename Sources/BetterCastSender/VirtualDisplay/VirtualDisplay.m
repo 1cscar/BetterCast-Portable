@@ -24,10 +24,22 @@
 
 id createVirtualDisplay(int width, int height, int ppi, BOOL hiDPI, NSString *name, unsigned int serialNum, int refreshRate, NSArray<NSValue *> *pointModes) {
 
-    CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
+    Class displayClass = NSClassFromString(@"CGVirtualDisplay");
+    Class descriptorClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
+    Class settingsClass = NSClassFromString(@"CGVirtualDisplaySettings");
+    Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+    if (![displayClass instancesRespondToSelector:@selector(initWithDescriptor:)] ||
+        ![displayClass instancesRespondToSelector:@selector(applySettings:)] ||
+        ![displayClass instancesRespondToSelector:@selector(displayID)] ||
+        ![descriptorClass instancesRespondToSelector:@selector(setMaxPixelsWide:)] ||
+        ![settingsClass instancesRespondToSelector:@selector(setModes:)] ||
+        ![modeClass instancesRespondToSelector:@selector(initWithWidth:height:refreshRate:)])
+        return nil;
+
+    CGVirtualDisplaySettings *settings = [[settingsClass alloc] init];
     settings.hiDPI = hiDPI;
 
-    CGVirtualDisplayDescriptor *descriptor = [[CGVirtualDisplayDescriptor alloc] init];
+    CGVirtualDisplayDescriptor *descriptor = [[descriptorClass alloc] init];
     descriptor.queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     descriptor.name = name;
 
@@ -52,13 +64,13 @@ id createVirtualDisplay(int width, int height, int ppi, BOOL hiDPI, NSString *na
     descriptor.productID = serialNum;
     descriptor.vendorID = 1;
 
-    CGVirtualDisplay *display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
+    CGVirtualDisplay *display = [[displayClass alloc] initWithDescriptor:descriptor];
 
     double hz = refreshRate > 0 ? refreshRate : 60;
     NSMutableArray<CGVirtualDisplayMode *> *modes = [NSMutableArray array];
     for (NSValue *value in pointModes) {
         NSSize size = value.sizeValue;
-        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:(unsigned int)size.width
+        [modes addObject:[[modeClass alloc] initWithWidth:(unsigned int)size.width
                                                               height:(unsigned int)size.height
                                                          refreshRate:hz]];
     }
@@ -68,7 +80,7 @@ id createVirtualDisplay(int width, int height, int ppi, BOOL hiDPI, NSString *na
             modeWide /= 2;
             modeHigh /= 2;
         }
-        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:modeWide
+        [modes addObject:[[modeClass alloc] initWithWidth:modeWide
                                                               height:modeHigh
                                                          refreshRate:hz]];
     }
