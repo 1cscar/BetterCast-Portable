@@ -52,6 +52,7 @@ private final class Peer {
     var lastProgress = DispatchTime.now().uptimeNanoseconds
     var started = DispatchTime.now().uptimeNanoseconds
     var seenVideo = false
+    var ending = false
     init(_ socket: NWConnection) { self.socket = socket }
 }
 
@@ -96,7 +97,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                 guard let self, self.listener === listener else { return }
                 switch state {
                 case .ready:
-                    self.code = bytes.map { String(format: "%02x", $0) }.joined()
+                    self.code = self.secret?.map { String(format: "%02x", $0) }.joined() ?? ""
                     self.status = "Listening on TCP \(port). Code expires in 5 minutes."
                 case .failed(let error):
                     self.stop("Could not listen: \(error.localizedDescription)")
@@ -143,6 +144,8 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
                 let box = try AES.GCM.SealedBox(nonce: nonce(0), ciphertext: data[32..<41], tag: data.suffix(16))
                 let hello = try AES.GCM.open(box, using: key(secret, transcript, 1))
                 self.secret = nil
+                self.listener?.cancel()
+                self.listener = nil
                 self.code = ""
                 candidate.serverKey = key(secret, transcript, 2)
                 candidate.width = Int(hello.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) })
@@ -180,22 +183,63 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
             reject(peer, "No hardware encoder for this codec and size. Try H.264 or a smaller mode.")
             return
         }
-        let display = VirtualDisplayManager(deviceKey: "portable-receiver")
-        guard let id = display.createDisplay(width: width, height: height, ppi: 110, hiDPI: false,
-                                             name: "BetterCast Portable", refreshRate: 60),
-              id != CGMainDisplayID(), CGDisplayIsInMirrorSet(id) == 0,
-              let mode = CGDisplayCopyDisplayMode(id), mode.pixelWidth == width, mode.pixelHeight == height else {
+        let highResolution = width * height > 2560 * 1440
+        let hiDPI = highResolution && width % 4 == 0 && height % 4 == 0
+        let density = hiDPI ? 2 : 1
+        let native = PixelSize(width: width / density, height: height / density)
+        // On some macOS builds a single high-resolution mode does not activate.
+        // Add a smaller bootstrap mode, then explicitly require the native mode before capture.
+        let modes = highResolution ? [native, PixelSize(width: native.width / 2, height: native.height / 2)] : []
+        let display = VirtualDisplayManager(deviceKey: "portable-\(width)x\(height)")
+        let displayID = autoreleasepool {
+            display.createDisplay(width: width, height: height, ppi: highResolution ? 163 : 110,
+                                  hiDPI: hiDPI, name: "BetterCast Portable", refreshRate: 60, pointModes: modes)
+        }
+        guard let id = displayID, id != CGMainDisplayID() else {
             encoder.invalidate()
             reject(peer, "An independent display at the requested resolution is unavailable.")
             return
         }
         self.display = display
         self.encoder = encoder
+        peer.started = DispatchTime.now().uptimeNanoseconds
+        status = "Waiting for macOS to activate the independent display."
+        Task { @MainActor [weak self, weak peer] in
+            // WindowServer registers the new display asynchronously.
+            for _ in 0..<30 {
+                guard let self, let peer, self.peer === peer, !peer.ending else { return }
+                if let mode = self.activateMode(id, width: width, height: height) {
+                    print("Portable extension id=\(id) mode=\(mode.pixelWidth)x\(mode.pixelHeight) points=\(mode.width)x\(mode.height) refresh=\(mode.refreshRate) mirror=0")
+                    self.startCapture(encoder, peer: peer, displayID: id)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if let peer { self?.reject(peer, "macOS did not activate the requested independent display mode.") }
+        }
+    }
+
+    private func activateMode(_ id: CGDirectDisplayID, width: Int, height: Int) -> CGDisplayMode? {
+        guard CGDisplayIsOnline(id) == 1, CGDisplayIsInMirrorSet(id) == 0 else { return nil }
+        let matches: (CGDisplayMode) -> Bool = {
+            $0.pixelWidth == width && $0.pixelHeight == height && abs($0.refreshRate - 60) < 0.1
+        }
+        if let current = CGDisplayCopyDisplayMode(id), matches(current) { return current }
+        guard let modes = CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode],
+              let target = modes.first(where: matches) else { return nil }
+        if CGDisplaySetDisplayMode(id, target, nil) == .success,
+           let current = CGDisplayCopyDisplayMode(id), matches(current) { return current }
+        return nil
+    }
+
+    private func startCapture(_ encoder: VideoEncoder, peer: Peer, displayID: CGDirectDisplayID) {
+        let width = peer.width
+        let height = peer.height
         captured = CaptureCount()
         encoded = 0
         sentBytes = 0
         encoder.delegate = self
-        let recorder = ScreenRecorder(videoEncoder: encoder, targetDisplayID: id, width: width,
+        let recorder = ScreenRecorder(videoEncoder: encoder, targetDisplayID: displayID, width: width,
                                       height: height, captureFPS: 60, strictDisplayCapture: true)
         recorder.onCapturedFrame = { [captured] in captured.increment() }
         recorder.onStreamStopped = { [weak self, weak peer] in
@@ -203,7 +247,6 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         }
         self.recorder = recorder
         peer.started = DispatchTime.now().uptimeNanoseconds
-        print("Portable extension id=\(id) mode=\(mode.pixelWidth)x\(mode.pixelHeight) refresh=\(mode.refreshRate) mirror=\(CGDisplayIsInMirrorSet(id))")
         status = "Starting \(width) × \(height) at a 60 FPS target. Arrange the display in System Settings."
         send(Data([4]), to: peer)
         Task { await recorder.startCapture() }
@@ -214,7 +257,10 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     }
 
     private func reject(_ peer: Peer, _ reason: String) {
-        guard self.peer === peer else { return }
+        guard self.peer === peer, !peer.ending else { return }
+        peer.ending = true
+        request = ""
+        status = reason
         send(Data([3]) + Data(reason.utf8), to: peer) { [weak self, weak peer] in
             if let peer { self?.end(peer, reason) }
         }
@@ -243,7 +289,7 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
     func videoEncoder(_ encoder: VideoEncoder, didEncode data: Data, for connectionId: UUID, isKeyframe: Bool) {
         encoder.sendStarted()
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.encoder === encoder, let peer = self.peer else { encoder.sendFinished(); return }
+            guard let self, self.encoder === encoder, let peer = self.peer, !peer.ending else { encoder.sendFinished(); return }
             self.encoded += 1
             self.sentBytes += data.count
             if !peer.seenVideo {
@@ -267,8 +313,9 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
             end(peer, "Direct connection stalled. Extension removed.")
             return
         }
-        guard let id = display?.displayID else { return }
-        guard CGDisplayIsOnline(id) != 0, CGDisplayIsInMirrorSet(id) == 0 else {
+        guard recorder != nil, !peer.ending, let id = display?.displayID else { return }
+        guard CGDisplayIsOnline(id) == 1, CGDisplayIsInMirrorSet(id) == 0,
+              let mode = CGDisplayCopyDisplayMode(id), mode.pixelWidth == peer.width, mode.pixelHeight == peer.height else {
             reject(peer, "Independent display is no longer available.")
             return
         }
@@ -295,7 +342,11 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
 
     func stop(_ message: String = "Stopped. Generate a new code to reconnect.") {
         let oldID = display?.displayID
-        recorder?.stopCapture()
+        if let recorder {
+            recorder.stopCapture()
+        } else {
+            encoder?.invalidate()
+        }
         recorder = nil
         encoder = nil
         display?.destroyDisplay()
@@ -313,37 +364,5 @@ final class PortableHost: ObservableObject, VideoEncoderDelegate {
         metrics = ""
         busy = false
         status = message
-    }
-}
-
-@main
-struct BetterCastPortableHostApp: App {
-    @StateObject private var host = PortableHost()
-
-    var body: some Scene {
-        WindowGroup("BetterCast Portable Host") {
-            VStack(alignment: .leading, spacing: 14) {
-                Text(host.status).font(.headline)
-                if !host.code.isEmpty {
-                    Text(host.code).font(.system(.title2, design: .monospaced)).textSelection(.enabled)
-                    Text("Enter this code and this Mac’s LAN IPv4 address in the receiver.")
-                }
-                if !host.request.isEmpty {
-                    Text(host.request)
-                    HStack {
-                        Button("Approve extension") { host.approve() }
-                        Button("Decline") { host.deny() }
-                    }
-                }
-                if !host.metrics.isEmpty { Text(host.metrics).monospacedDigit() }
-                HStack {
-                    Button("Generate pairing code") { host.pair() }.disabled(host.busy)
-                    Button("Stop") { host.stop() }.disabled(!host.busy)
-                }
-            }
-            .padding(24)
-            .frame(minWidth: 540, minHeight: 170)
-            .onDisappear { host.stop() }
-        }
     }
 }

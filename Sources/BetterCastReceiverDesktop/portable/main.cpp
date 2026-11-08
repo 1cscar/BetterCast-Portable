@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Playback.h"
-#include <cmath>
 #include <mutex>
 #include <thread>
 
 namespace {
-constexpr int HostEdit = 101, CodeEdit = 102, HevcBox = 103, ConnectButton = 104, Shortcut = 105;
+constexpr int HostEdit = 101, CodeEdit = 102, HevcBox = 103, ConnectButton = 104, Shortcut = 105, Resolution = 106;
 constexpr UINT StatusUpdate = WM_APP + 1, SessionEnded = WM_APP + 2;
 constexpr wchar_t ClassName[] = L"BetterCastPortableReceiver";
 
@@ -202,8 +201,14 @@ struct Session {
         for (auto label : {L"Esc", L"Ctrl + Shift + Q", L"Alt + Shift + Q"})
             SendMessageW(shortcut, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
         SendMessageW(shortcut, CB_SETCURSEL, 0, 0);
-        fields.push_back(control(L"BUTTON", L"Connect", WS_TABSTOP, 362, 132, 88, 28, ConnectButton));
-        status = control(L"STATIC", L"Move this window onto the target monitor before connecting.", 0, 20, 175, 430, 64);
+        fields.push_back(control(L"STATIC", L"Stream size", 0, 20, 170, 155, 24));
+        auto resolution = control(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST, 180, 168, 175, 120, Resolution);
+        fields.push_back(resolution);
+        for (auto label : {L"Native (up to 4K)", L"Cap at 1440p", L"Cap at 1080p"})
+            SendMessageW(resolution, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        SendMessageW(resolution, CB_SETCURSEL, 0, 0);
+        fields.push_back(control(L"BUTTON", L"Connect", WS_TABSTOP, 362, 168, 88, 28, ConnectButton));
+        status = control(L"STATIC", L"Move this window onto the target monitor before connecting.", 0, 20, 210, 430, 64);
         fields.push_back(status);
         overlay = control(L"STATIC", L"", SS_CENTER, 12, 12, 570, 30);
         ShowWindow(overlay, SW_HIDE);
@@ -213,8 +218,11 @@ struct Session {
         if (worker.joinable()) return;
         try {
             const auto monitor = monitorFor(window);
-            const double scale = (std::min)({1.0, 3840.0 / monitor.width, 3840.0 / monitor.height,
-                                            std::sqrt(3840.0 * 2160.0 / monitor.width / monitor.height)});
+            const auto choice = SendDlgItemMessageW(window, Resolution, CB_GETCURSEL, 0, 0);
+            const double maxWide = choice == 2 ? 1920.0 : choice == 1 ? 2560.0 : 3840.0;
+            const double maxShort = choice == 2 ? 1080.0 : choice == 1 ? 1440.0 : 2160.0;
+            const double scale = (std::min)({1.0, maxWide / std::max(monitor.width, monitor.height),
+                                            maxShort / std::min(monitor.width, monitor.height)});
             const UINT width = UINT(monitor.width * scale) & ~1u;
             const UINT height = UINT(monitor.height * scale) & ~1u;
             if (width < 320 || height < 320) throw std::runtime_error("Display mode is too small.");
@@ -362,7 +370,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR args, int show) {
     session.instance = instance;
     auto window = CreateWindowExW(0, ClassName, L"BetterCast Portable Receiver",
                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 495, 285, nullptr, nullptr, instance, &session);
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 495, 320, nullptr, nullptr, instance, &session);
     if (!window) return 2;
     if (std::wstring(args) == L"--self-test") {
         ShowWindow(window, SW_SHOWNORMAL);

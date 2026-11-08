@@ -1,5 +1,7 @@
 # BetterCast
 
+[BetterCast Portable](docs/portable.md) is the Mac-host / single-file Windows receiver prototype on this branch. [G0 upstream audit](docs/portable-g0.md).
+
 BetterCast is an open-source screen extension app that turns almost any device into a wireless extra display for your Mac or Windows PC. Think Sidecar or AirPlay Receiver — but cross-platform and built for hardware Apple no longer supports, right down to using an old 5K iMac as a Thunderbolt display.
 
 <p align="center">

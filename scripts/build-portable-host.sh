@@ -14,10 +14,26 @@ module VirtualDisplayLib {
     export *
 }
 MODULE
+host="Sources/BetterCastPortableHost"
+entry="$host/PortableHostApp.swift"
+binary="$app/Contents/MacOS/BetterCastPortableHost"
+if [[ "${1:-}" == --loopback ]]; then
+    entry="scripts/portable-smoke/Loopback.swift"
+    binary="$build/LocalSmoke"
+fi
 xcrun swiftc -sdk "$sdk" -target "$target" -O -I "$build" \
     "$sender"/{Constants,VirtualDisplayManager,ScreenFit,ScreenRecorder,LegacyDisplayCapture,AudioEncoder,VideoEncoder,LogManager}.swift \
-    Sources/BetterCastPortableHost/PortableHost.swift "$build/VirtualDisplay.o" \
-    -o "$app/Contents/MacOS/BetterCastPortableHost"
+    "$host/PortableHost.swift" "$entry" "$build/VirtualDisplay.o" -o "$binary"
+if [[ "${1:-}" == --loopback ]]; then
+    python="$(command -v python3)"
+    "$python" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM'
+    for mode in '1920 1080 1 1080p-h264' '2560 1440 1 1440p-h264' '3840 2160 2 4k-hevc' '3840 2160 1 4k-h264'; do
+        read -r width height codec label <<< "$mode"
+        "$binary" "$width" "$height" "$codec" "$python" scripts/portable-smoke/receive.py \
+            | tee "$build/$label-loopback.log"
+    done
+    exit
+fi
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

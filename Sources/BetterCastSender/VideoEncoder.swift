@@ -475,37 +475,27 @@ class VideoEncoder {
             }
         }
         
-        // 3. Append the Frame Data
+        // 3. Append the encoder's length-prefixed access unit. A block buffer can
+        // consist of multiple memory segments, so a pointer to its first byte is
+        // valid for the whole frame only when lengthAtOffset == totalLength.
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        var lengthAtOffset: Int = 0
-        var totalLength: Int = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        
-        if CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset, totalLengthOut: &totalLength, dataPointerOut: &dataPointer) == noErr {
-            
-            var bufferOffset = 0
-            let headerLength = 4 // AVCC 4 bytes length
-            
-            while bufferOffset < totalLength - headerLength {
-                var atomLength: UInt32 = 0
-                memcpy(&atomLength, dataPointer! + bufferOffset, 4)
-                atomLength = UInt32(bigEndian: atomLength)
-                
-                bufferOffset += 4 // Skip length
-                
-                if bufferOffset + Int(atomLength) > totalLength { break }
-                
-                let nalData = Data(bytes: dataPointer! + bufferOffset, count: Int(atomLength))
-                
-                // Append [Len][NALU]
-                var avccLen = UInt32(atomLength).bigEndian
-                coalescedData.append(Data(bytes: &avccLen, count: 4))
-                coalescedData.append(nalData)
-                
-                bufferOffset += Int(atomLength)
+        let length = CMBlockBufferGetDataLength(dataBuffer)
+        guard length > 4 else { return }
+        var contiguousLength = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        if CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: &contiguousLength,
+                                      totalLengthOut: nil, dataPointerOut: &pointer) == noErr,
+           contiguousLength == length, let pointer {
+            coalescedData.append(UnsafeRawPointer(pointer).assumingMemoryBound(to: UInt8.self), count: length)
+        } else {
+            var data = Data(count: length)
+            let status = data.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
             }
+            guard status == noErr else { return }
+            coalescedData.append(data)
         }
-        
+
         // 4. Send One Megapacket (with PTS Header)
         if !coalescedData.isEmpty {
              var packetWithPTS = Data()

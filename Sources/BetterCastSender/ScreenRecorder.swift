@@ -10,7 +10,13 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // during that window it would no-op on a nil stream and the about-to-start stream
     // would leak — capturing forever with no way to stop it. This flag lets an in-flight
     // start abort and tear itself down.
-    private var stopRequested = false
+    private let lifecycleLock = NSLock()
+    private var stopped = false
+    private var stopRequested: Bool {
+        get { lifecycleLock.withLock { stopped } }
+        set { lifecycleLock.withLock { stopped = newValue } }
+    }
+    private let portableSamples = DispatchQueue(label: "org.bettercast.portable.capture", qos: .userInitiated)
     private var videoEncoder: VideoEncoder?
     private var targetDisplayID: CGDirectDisplayID?
     var audioEncoder: AudioEncoder?
@@ -45,7 +51,11 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     
     func startCapture() async {
-        stopRequested = false
+        if strictDisplayCapture {
+            guard !stopRequested else { return }
+        } else {
+            stopRequested = false
+        }
 
         // ── Legacy capture path (CGDisplayStream) ──
         if useLegacyCapture && !strictDisplayCapture {
@@ -77,7 +87,9 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             
             if strictDisplayCapture {
                 guard let display, display.displayID != CGMainDisplayID(),
-                      CGDisplayIsInMirrorSet(display.displayID) == 0 else {
+                      CGDisplayIsInMirrorSet(display.displayID) == 0,
+                      let mode = CGDisplayCopyDisplayMode(display.displayID),
+                      mode.pixelWidth == width, mode.pixelHeight == height else {
                     LogManager.shared.log("ScreenRecorder: Independent target display is unavailable")
                     DispatchQueue.main.async { [weak self] in self?.onStreamStopped?() }
                     return
@@ -116,7 +128,8 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             config.capturesAudio = captureAudio
 
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
-            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .userInitiated))
+            let sampleQueue = strictDisplayCapture ? portableSamples : DispatchQueue.global(qos: .userInitiated)
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
             if captureAudio {
                 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
                 LogManager.shared.log("ScreenRecorder: Audio capture enabled")
@@ -163,7 +176,9 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         Task {
             try? await stream?.stopCapture()
             stream = nil
-            if strictDisplayCapture { videoEncoder?.invalidate() }
+            if strictDisplayCapture {
+                portableSamples.async { self.videoEncoder?.invalidate() }
+            }
         }
     }
 
@@ -353,7 +368,8 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         switch type {
         case .screen:
             if strictDisplayCapture {
-                guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                guard !stopRequested,
+                      let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                         as? [[SCStreamFrameInfo: Any]],
                       let rawStatus = attachments.first?[.status] as? Int,
                       SCFrameStatus(rawValue: rawStatus) == .complete,
@@ -382,7 +398,7 @@ class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             audioEncoder?.encode(sampleBuffer: sampleBuffer)
 
-        @unknown default:
+        default:
             break
         }
     }
